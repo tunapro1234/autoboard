@@ -1,200 +1,300 @@
 """
 Export Circuit to KiCad schematic (.kicad_sch) format.
-Generates a valid KiCad 7+ schematic file that can be opened in KiCad
-and validated with `kicad-cli sch erc`.
+Generates a KiCad 9-compatible schematic with symbols, wires and labels.
 """
 
+from __future__ import annotations
+
+import re
 import uuid
+
 from .circuit import Circuit, Component
 
-# Grid spacing in KiCad units (mm * 2.54 for mil grid)
 GRID = 2.54
-COMPONENT_SPACING_X = 30.0
-COMPONENT_SPACING_Y = 20.0
+COMPONENT_SPACING_X = 32.0
+COMPONENT_SPACING_Y = 24.0
+LIB_PREFIX = "pcb_llm"
 
 
 def _uuid() -> str:
     return str(uuid.uuid4())
 
 
-def _symbol_lib(comp: Component) -> str:
-    """Generate the lib_symbols entry for a component."""
-    if comp.kind == "resistor":
-        return _resistor_symbol(comp)
-    elif comp.kind == "capacitor":
-        return _capacitor_symbol(comp)
-    elif comp.kind == "led":
-        return _led_symbol(comp)
-    elif comp.kind == "diode":
-        return _diode_symbol(comp)
-    elif comp.kind == "voltage_source":
-        return _vsource_symbol(comp)
-    return ""
+def _q(value: str) -> str:
+    """Escape string for KiCad S-expression quoted strings."""
+    text = str(value)
+    return text.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _resistor_symbol(comp: Component) -> str:
-    return f"""    (symbol "{comp.ref}:R" (pin_names (offset 0) hide) (in_bom yes) (on_board yes)
-      (property "Reference" "{comp.ref}" (at 2.032 0 90) (effects (font (size 1.27 1.27))))
-      (property "Value" "{comp.value}" (at 0 0 90) (effects (font (size 1.27 1.27))))
-      (property "Footprint" "" (at -1.778 0 90) (effects (font (size 1.27 1.27))))
-      (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (symbol "{comp.ref}:R_0_1"
-        (rectangle (start -1.016 -2.54) (end 1.016 2.54)
-          (stroke (width 0.254) (type default)) (fill (type none))))
-      (symbol "{comp.ref}:R_1_1"
-        (pin passive line (at 0 3.81 270) (length 1.27)
-          (name "1" (effects (font (size 0.508 0.508))))
-          (number "1" (effects (font (size 0.508 0.508)))))
-        (pin passive line (at 0 -3.81 90) (length 1.27)
-          (name "2" (effects (font (size 0.508 0.508))))
-          (number "2" (effects (font (size 0.508 0.508)))))))"""
+def _project_name(raw_name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_]", "_", raw_name.strip())
+    return safe or "project"
 
 
-def _capacitor_symbol(comp: Component) -> str:
-    return f"""    (symbol "{comp.ref}:C" (pin_names (offset 0) hide) (in_bom yes) (on_board yes)
-      (property "Reference" "{comp.ref}" (at 0.635 2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "{comp.value}" (at 0.635 -2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 0.9652 -3.81 0) (effects (font (size 1.27 1.27))))
-      (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (symbol "{comp.ref}:C_0_1"
-        (polyline (pts (xy -2.032 -0.762) (xy 2.032 -0.762))
-          (stroke (width 0.508) (type default)) (fill (type none)))
-        (polyline (pts (xy -2.032 0.762) (xy 2.032 0.762))
-          (stroke (width 0.508) (type default)) (fill (type none))))
-      (symbol "{comp.ref}:C_1_1"
-        (pin passive line (at 0 3.81 270) (length 2.794)
-          (name "1" (effects (font (size 0.508 0.508))))
-          (number "1" (effects (font (size 0.508 0.508)))))
-        (pin passive line (at 0 -3.81 90) (length 2.794)
-          (name "2" (effects (font (size 0.508 0.508))))
-          (number "2" (effects (font (size 0.508 0.508)))))))"""
+def _ref_prefix(ref: str) -> str:
+    match = re.match(r"[A-Za-z#]+", ref)
+    return match.group(0) if match else "U"
 
 
-def _led_symbol(comp: Component) -> str:
-    return f"""    (symbol "{comp.ref}:LED" (pin_names (offset 1.016) hide) (in_bom yes) (on_board yes)
-      (property "Reference" "{comp.ref}" (at 1.27 2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "LED" (at 1.27 -2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (symbol "{comp.ref}:LED_0_1"
-        (polyline (pts (xy -1.27 -1.27) (xy -1.27 1.27))
-          (stroke (width 0.254) (type default)) (fill (type none)))
-        (polyline (pts (xy -1.27 0) (xy 1.27 0))
-          (stroke (width 0) (type default)) (fill (type none)))
-        (polyline (pts (xy 1.27 -1.27) (xy 1.27 1.27) (xy -1.27 0) (xy 1.27 -1.27))
-          (stroke (width 0.254) (type default)) (fill (type none))))
-      (symbol "{comp.ref}:LED_1_1"
-        (pin passive line (at -3.81 0 0) (length 2.54)
-          (name "K" (effects (font (size 1.27 1.27))))
-          (number "1" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 3.81 0 180) (length 2.54)
-          (name "A" (effects (font (size 1.27 1.27))))
-          (number "2" (effects (font (size 1.27 1.27)))))))"""
+def _pin_layout(comp: Component) -> tuple[list[dict], dict[str, str], float, float]:
+    """
+    Create a simple rectangular symbol pin layout.
+    Returns (pins, pin_name_to_number, body_width, body_height).
+    """
+    pin_names = list(comp.pins.keys())
+    if not pin_names:
+        pin_names = ["1"]
+
+    left_count = (len(pin_names) + 1) // 2
+    right_count = len(pin_names) - left_count
+    rows = max(left_count, right_count, 1)
+
+    pitch = GRID
+    body_width = 7.62
+    body_height = max(5.08, (rows - 1) * pitch + 5.08)
+    top_y = (rows - 1) * pitch / 2.0
+
+    pins: list[dict] = []
+    pin_map: dict[str, str] = {}
+    pin_num = 1
+
+    # Left side pins
+    for i, pin_name in enumerate(pin_names[:left_count]):
+        y = top_y - i * pitch
+        number = str(pin_num)
+        pin_map[pin_name] = number
+        pins.append({
+            "name": pin_name,
+            "number": number,
+            "x": -body_width / 2 - 2.54,
+            "y": y,
+            "orientation": 0,
+            "length": 2.54,
+        })
+        pin_num += 1
+
+    # Right side pins
+    for i, pin_name in enumerate(pin_names[left_count:]):
+        y = top_y - i * pitch
+        number = str(pin_num)
+        pin_map[pin_name] = number
+        pins.append({
+            "name": pin_name,
+            "number": number,
+            "x": body_width / 2 + 2.54,
+            "y": y,
+            "orientation": 180,
+            "length": 2.54,
+        })
+        pin_num += 1
+
+    return pins, pin_map, body_width, body_height
 
 
-def _diode_symbol(comp: Component) -> str:
-    return _led_symbol(comp)  # same shape for MVP
+def _lib_name(comp: Component) -> str:
+    return f"{comp.ref}_SYM"
 
 
-def _vsource_symbol(comp: Component) -> str:
-    return f"""    (symbol "{comp.ref}:VSOURCE" (pin_names (offset 1.016)) (in_bom yes) (on_board yes)
-      (property "Reference" "{comp.ref}" (at 2.54 2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Value" "{comp.value}V" (at 2.54 -2.54 0) (effects (font (size 1.27 1.27)) (justify left)))
-      (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27))))
-      (property "Sim.Type" "DC" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (property "Sim.Params" "dc={comp.value}" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))
-      (symbol "{comp.ref}:VSOURCE_0_1"
-        (circle (center 0 0) (radius 2.54)
-          (stroke (width 0.254) (type default)) (fill (type none))))
-      (symbol "{comp.ref}:VSOURCE_1_1"
-        (pin passive line (at 0 5.08 270) (length 2.54)
-          (name "+" (effects (font (size 1.27 1.27))))
-          (number "1" (effects (font (size 1.27 1.27)))))
-        (pin passive line (at 0 -5.08 90) (length 2.54)
-          (name "-" (effects (font (size 1.27 1.27))))
-          (number "2" (effects (font (size 1.27 1.27)))))))"""
+def _lib_symbol(comp: Component) -> tuple[str, dict[str, str], dict[str, tuple[float, float]]]:
+    pins, pin_map, body_w, body_h = _pin_layout(comp)
+    lib_name = _lib_name(comp)
+
+    half_w = body_w / 2.0
+    half_h = body_h / 2.0
+    ref_text = _ref_prefix(comp.ref)
+
+    lines = [
+        f'    (symbol "{LIB_PREFIX}:{_q(lib_name)}"',
+        '      (pin_names (offset 1.016))',
+        '      (exclude_from_sim no)',
+        '      (in_bom yes)',
+        '      (on_board yes)',
+        f'      (property "Reference" "{_q(ref_text)}" (at 0 {half_h + 1.27:.3f} 0)',
+        '        (effects (font (size 1.27 1.27))))',
+        f'      (property "Value" "{_q(comp.value)}" (at 0 {-half_h - 1.27:.3f} 0)',
+        '        (effects (font (size 1.27 1.27))))',
+        f'      (property "Footprint" "{_q(comp.footprint)}" (at 0 0 0)',
+        '        (effects (font (size 1.27 1.27)) (hide yes)))',
+        '      (property "Datasheet" "" (at 0 0 0)',
+        '        (effects (font (size 1.27 1.27)) (hide yes)))',
+        f'      (symbol "{_q(lib_name)}_0_1"',
+        f'        (rectangle (start {-half_w:.3f} {-half_h:.3f}) (end {half_w:.3f} {half_h:.3f})',
+        '          (stroke (width 0.254) (type default)) (fill (type background))))',
+        f'      (symbol "{_q(lib_name)}_1_1"',
+    ]
+
+    pin_points: dict[str, tuple[float, float]] = {}
+    for pin in pins:
+        lines.extend([
+            f'        (pin passive line (at {pin["x"]:.3f} {pin["y"]:.3f} {pin["orientation"]}) (length {pin["length"]:.3f})',
+            f'          (name "{_q(pin["name"])}" (effects (font (size 0.762 0.762))))',
+            f'          (number "{pin["number"]}" (effects (font (size 0.762 0.762)))))',
+        ])
+        pin_points[pin["name"]] = (pin["x"], pin["y"])
+
+    lines.extend([
+        '      )',
+        '      (embedded_fonts no)',
+        '    )',
+    ])
+
+    return "\n".join(lines), pin_map, pin_points
+
+
+def _place_component(comp: Component, x: float, y: float, project: str,
+                     sch_uuid: str, pin_numbers: list[str]) -> str:
+    lib_name = _lib_name(comp)
+
+    lines = [
+        '  (symbol',
+        f'    (lib_id "{LIB_PREFIX}:{_q(lib_name)}")',
+        f'    (at {x:.3f} {y:.3f} 0)',
+        '    (unit 1)',
+        '    (exclude_from_sim no)',
+        '    (in_bom yes)',
+        '    (on_board yes)',
+        '    (dnp no)',
+        '    (fields_autoplaced yes)',
+        f'    (uuid "{_uuid()}")',
+        f'    (property "Reference" "{_q(comp.ref)}" (at {x:.3f} {y - 3.81:.3f} 0)',
+        '      (effects (font (size 1.27 1.27))))',
+        f'    (property "Value" "{_q(comp.value)}" (at {x:.3f} {y + 3.81:.3f} 0)',
+        '      (effects (font (size 1.27 1.27))))',
+        f'    (property "Footprint" "{_q(comp.footprint)}" (at {x:.3f} {y:.3f} 0)',
+        '      (effects (font (size 1.27 1.27)) (hide yes)))',
+        '    (property "Datasheet" "" (at 0 0 0)',
+        '      (effects (font (size 1.27 1.27)) (hide yes)))',
+    ]
+
+    for pin_number in pin_numbers:
+        lines.extend([
+            f'    (pin "{pin_number}"',
+            f'      (uuid "{_uuid()}")',
+            '    )',
+        ])
+
+    lines.extend([
+        '    (instances',
+        f'      (project "{_q(project)}"',
+        f'        (path "/{sch_uuid}"',
+        f'          (reference "{_q(comp.ref)}")',
+        '          (unit 1)',
+        '        )',
+        '      )',
+        '    )',
+        '  )',
+    ])
+
+    return "\n".join(lines)
+
+
+def _wire(x1: float, y1: float, x2: float, y2: float) -> str:
+    return (
+        '  (wire\n'
+        '    (pts\n'
+        f'      (xy {x1:.3f} {y1:.3f}) (xy {x2:.3f} {y2:.3f})\n'
+        '    )\n'
+        '    (stroke (width 0) (type default))\n'
+        f'    (uuid "{_uuid()}")\n'
+        '  )'
+    )
+
+
+def _label(text: str, x: float, y: float) -> str:
+    return (
+        f'  (label "{_q(text)}"\n'
+        f'    (at {x:.3f} {y:.3f} 0)\n'
+        '    (effects (font (size 1.27 1.27)) (justify left bottom))\n'
+        f'    (uuid "{_uuid()}")\n'
+        '  )'
+    )
 
 
 def export_schematic(circuit: Circuit, output_path: str) -> str:
-    """Export circuit to KiCad schematic file. Returns the file path."""
+    """Export circuit to KiCad schematic file. Returns output path."""
     sch_uuid = _uuid()
+    project = _project_name(circuit.name)
 
-    # Build lib_symbols
-    lib_symbols = []
-    for comp in circuit.components.values():
-        sym = _symbol_lib(comp)
-        if sym:
-            lib_symbols.append(sym)
+    components = [(r, c) for r, c in circuit.components.items() if not c.simulation_only]
 
-    # Place components on a grid
-    symbol_instances = []
-    x, y = 100.0, 80.0
-    for i, (ref, comp) in enumerate(circuit.components.items()):
-        sx = x + (i % 4) * COMPONENT_SPACING_X
-        sy = y + (i // 4) * COMPONENT_SPACING_Y
-        inst = _place_component(comp, sx, sy)
-        symbol_instances.append(inst)
+    # Build symbol library entries and pin maps.
+    lib_symbols: list[str] = []
+    pin_num_by_ref: dict[str, dict[str, str]] = {}
+    pin_point_by_ref: dict[str, dict[str, tuple[float, float]]] = {}
+    for _, comp in components:
+        lib_entry, pin_map, pin_points = _lib_symbol(comp)
+        lib_symbols.append(lib_entry)
+        pin_num_by_ref[comp.ref] = pin_map
+        pin_point_by_ref[comp.ref] = pin_points
 
-    # Build wires from nets
-    # (simplified: for MVP, we list nets as labels rather than drawing wires)
-    net_labels = []
-    label_positions = {}
-    for comp in circuit.components.values():
-        cx = x + (list(circuit.components.keys()).index(comp.ref) % 4) * COMPONENT_SPACING_X
-        cy = y + (list(circuit.components.keys()).index(comp.ref) // 4) * COMPONENT_SPACING_Y
-        for pin_idx, (pin_name, net_name) in enumerate(comp.pins.items()):
-            if net_name not in label_positions:
-                lx = cx + (pin_idx * 10) - 5
-                ly = cy - 10
-                label_positions[net_name] = (lx, ly)
-                net_labels.append(
-                    f'  (net_label "{net_name}" (at {lx} {ly} 0) (effects (font (size 1.27 1.27)))\n'
-                    f'    (uuid {_uuid()}))'
-                )
+    # Grid placement.
+    origin_x, origin_y = 100.0, 80.0
+    cols = 4
+    positions: dict[str, tuple[float, float]] = {}
+    symbol_instances: list[str] = []
+    for i, (ref, comp) in enumerate(components):
+        x = origin_x + (i % cols) * COMPONENT_SPACING_X
+        y = origin_y + (i // cols) * COMPONENT_SPACING_Y
+        positions[ref] = (x, y)
+        pin_numbers = list(pin_num_by_ref[ref].values())
+        symbol_instances.append(_place_component(comp, x, y, project, sch_uuid, pin_numbers))
 
-    content = f"""(kicad_sch (version 20230121) (generator "pcb_llm_pipeline")
+    # Net wiring and labels.
+    wire_items: list[str] = []
+    label_items: list[str] = []
 
-  (uuid {sch_uuid})
+    for net_name, net in circuit.nets.items():
+        points: list[tuple[float, float]] = []
+        for ref, pin_name in net.components:
+            if ref not in positions or ref not in pin_point_by_ref:
+                continue
+            rel = pin_point_by_ref[ref].get(pin_name)
+            if rel is None:
+                continue
+            cx, cy = positions[ref]
+            points.append((cx + rel[0], cy + rel[1]))
 
-  (paper "A4")
+        if not points:
+            continue
 
-  (lib_symbols
-{chr(10).join(lib_symbols)}
-  )
+        root_x, root_y = points[0]
 
-{chr(10).join(symbol_instances)}
+        # Short local label near first connection point.
+        label_items.append(_label(net_name, root_x + 1.27, root_y + 0.635))
 
-)
-"""
-    with open(output_path, "w") as f:
+        for x, y in points[1:]:
+            if x == root_x or y == root_y:
+                wire_items.append(_wire(root_x, root_y, x, y))
+                continue
+
+            # Orthogonal routing segment pair for readability.
+            wire_items.append(_wire(root_x, root_y, x, root_y))
+            wire_items.append(_wire(x, root_y, x, y))
+
+    content = "\n".join([
+        '(kicad_sch',
+        '  (version 20250114)',
+        '  (generator "pcb_llm_pipeline")',
+        '  (generator_version "0.2")',
+        f'  (uuid "{sch_uuid}")',
+        '  (paper "A4")',
+        '  (lib_symbols',
+        "\n".join(lib_symbols),
+        '  )',
+        "\n".join(wire_items),
+        "\n".join(label_items),
+        "\n".join(symbol_instances),
+        '  (sheet_instances',
+        '    (path "/"',
+        '      (page "1")',
+        '    )',
+        '  )',
+        '  (embedded_fonts no)',
+        ')',
+        '',
+    ])
+
+    with open(output_path, "w", encoding="utf-8") as f:
         f.write(content)
 
     return output_path
-
-
-def _place_component(comp: Component, x: float, y: float) -> str:
-    """Generate a symbol instance placement."""
-    lib_name = {
-        "resistor": "R",
-        "capacitor": "C",
-        "led": "LED",
-        "diode": "LED",
-        "voltage_source": "VSOURCE",
-    }.get(comp.kind, comp.kind)
-
-    return f"""  (symbol (lib_id "{comp.ref}:{lib_name}") (at {x} {y} 0) (unit 1)
-    (in_bom yes) (on_board yes) (dnp no)
-    (uuid {_uuid()})
-    (property "Reference" "{comp.ref}" (at {x + 2} {y - 3} 0)
-      (effects (font (size 1.27 1.27))))
-    (property "Value" "{comp.value}" (at {x + 2} {y + 3} 0)
-      (effects (font (size 1.27 1.27))))
-    (property "Footprint" "" (at {x} {y} 0)
-      (effects (font (size 1.27 1.27)) hide))
-    (property "Datasheet" "" (at {x} {y} 0)
-      (effects (font (size 1.27 1.27)) hide))
-    (instances
-      (project "{comp.ref}"
-        (path "/" (reference "{comp.ref}") (unit 1))))
-  )"""

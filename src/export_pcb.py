@@ -7,6 +7,7 @@ import uuid
 import subprocess
 import os
 import re
+import json
 from .circuit import Circuit, Component
 
 GRID_MM = 2.54
@@ -17,48 +18,146 @@ def _uuid() -> str:
     return str(uuid.uuid4())
 
 
+# --- Footprint definitions ---
+# Each footprint has:
+#   pads: list of pad defs (number, x, y, size, drill, type="thru_hole"|"smd", shape, layers)
+#   courtyard: bounding box
+#   silk: silkscreen label
+
+def _thru_pad(number, x, y, size=1.6, drill=0.8):
+    return {"number": str(number), "x": x, "y": y, "size": size, "drill": drill,
+            "type": "thru_hole", "shape": "circle", "layers": '"*.Cu" "*.Mask"'}
+
+def _smd_pad(number, x, y, sx, sy):
+    return {"number": str(number), "x": x, "y": y, "size": (sx, sy),
+            "type": "smd", "shape": "rect", "layers": '"F.Cu" "F.Paste" "F.Mask"'}
+
+
 # Simple through-hole footprint definitions (mm)
 FOOTPRINTS = {
     "resistor": {
-        "pads": [
-            {"number": "1", "x": 0, "y": 0, "size": 1.6, "drill": 0.8},
-            {"number": "2", "x": 0, "y": 7.62, "size": 1.6, "drill": 0.8},
-        ],
+        "pads": [_thru_pad("1", 0, 0), _thru_pad("2", 0, 7.62)],
         "courtyard": {"x": -1.5, "y": -1.0, "w": 3.0, "h": 9.62},
         "silk": "R",
     },
     "capacitor": {
-        "pads": [
-            {"number": "1", "x": 0, "y": 0, "size": 1.6, "drill": 0.8},
-            {"number": "2", "x": 0, "y": 5.08, "size": 1.6, "drill": 0.8},
-        ],
+        "pads": [_thru_pad("1", 0, 0), _thru_pad("2", 0, 5.08)],
         "courtyard": {"x": -1.5, "y": -1.0, "w": 3.0, "h": 7.08},
         "silk": "C",
     },
     "led": {
-        "pads": [
-            {"number": "1", "x": 0, "y": 0, "size": 1.6, "drill": 0.8},   # K
-            {"number": "2", "x": 0, "y": 5.08, "size": 1.6, "drill": 0.8}, # A
-        ],
+        "pads": [_thru_pad("1", 0, 0), _thru_pad("2", 0, 5.08)],  # 1=K, 2=A
         "courtyard": {"x": -1.5, "y": -1.0, "w": 3.0, "h": 7.08},
         "silk": "D",
     },
     "diode": {
-        "pads": [
-            {"number": "1", "x": 0, "y": 0, "size": 1.6, "drill": 0.8},
-            {"number": "2", "x": 0, "y": 5.08, "size": 1.6, "drill": 0.8},
-        ],
+        "pads": [_thru_pad("1", 0, 0), _thru_pad("2", 0, 5.08)],
         "courtyard": {"x": -1.5, "y": -1.0, "w": 3.0, "h": 7.08},
         "silk": "D",
     },
     "voltage_source": {
-        # 2-pin header for power connector
-        "pads": [
-            {"number": "1", "x": 0, "y": 0, "size": 1.7, "drill": 1.0},
-            {"number": "2", "x": 0, "y": 2.54, "size": 1.7, "drill": 1.0},
-        ],
+        "pads": [_thru_pad("1", 0, 0, 1.7, 1.0), _thru_pad("2", 0, 2.54, 1.7, 1.0)],
         "courtyard": {"x": -1.5, "y": -1.0, "w": 3.0, "h": 4.54},
         "silk": "J",
+    },
+    # --- SMD Footprints for ESP32 dev board ---
+    "resistor_0603": {
+        "pads": [_smd_pad("1", -0.75, 0, 0.8, 0.8), _smd_pad("2", 0.75, 0, 0.8, 0.8)],
+        "courtyard": {"x": -1.4, "y": -0.65, "w": 2.8, "h": 1.3},
+        "silk": "R",
+    },
+    "capacitor_0603": {
+        "pads": [_smd_pad("1", -0.75, 0, 0.8, 0.8), _smd_pad("2", 0.75, 0, 0.8, 0.8)],
+        "courtyard": {"x": -1.4, "y": -0.65, "w": 2.8, "h": 1.3},
+        "silk": "C",
+    },
+    "led_0603": {
+        "pads": [_smd_pad("1", -0.75, 0, 0.8, 0.8), _smd_pad("2", 0.75, 0, 0.8, 0.8)],
+        "courtyard": {"x": -1.4, "y": -0.65, "w": 2.8, "h": 1.3},
+        "silk": "D",
+    },
+    # SOT-223 (AMS1117-3.3): 4 pads - 3 bottom + 1 large top tab
+    "sot223": {
+        "pads": [
+            _smd_pad("1", -2.3, 3.15, 1.0, 1.5),   # GND (pin 1)
+            _smd_pad("2", 0, 3.15, 1.0, 1.5),       # VOUT (pin 2)
+            _smd_pad("3", 2.3, 3.15, 1.0, 1.5),     # VIN (pin 3)
+            _smd_pad("4", 0, -3.15, 3.0, 1.5),      # Tab = VOUT (pin 4)
+        ],
+        "courtyard": {"x": -3.5, "y": -4.5, "w": 7.0, "h": 9.0},
+        "silk": "U",
+    },
+    # SOT-23-6 (USBLC6-2SC6)
+    "sot23_6": {
+        "pads": [
+            _smd_pad("1", -0.95, 1.1, 0.6, 0.7),    # I/O1
+            _smd_pad("2", 0, 1.1, 0.6, 0.7),         # GND
+            _smd_pad("3", 0.95, 1.1, 0.6, 0.7),      # I/O2
+            _smd_pad("4", 0.95, -1.1, 0.6, 0.7),     # I/O2 (other side)
+            _smd_pad("5", 0, -1.1, 0.6, 0.7),        # VBUS
+            _smd_pad("6", -0.95, -1.1, 0.6, 0.7),    # I/O1 (other side)
+        ],
+        "courtyard": {"x": -1.6, "y": -1.8, "w": 3.2, "h": 3.6},
+        "silk": "U",
+    },
+    # USB-C 16-pin connector (simplified: 2 CC + 2 D+ + 2 D- + VBUS + GND + shield)
+    "usb_c": {
+        "pads": [
+            # Top row SMD
+            _smd_pad("A1", -3.25, 0, 0.6, 1.2),     # GND
+            _smd_pad("A4", -2.25, 0, 0.6, 1.2),     # VBUS
+            _smd_pad("A5", -0.25, 0, 0.3, 1.2),     # CC1
+            _smd_pad("A6", 0.25, 0, 0.3, 1.2),      # D+
+            _smd_pad("A7", 1.0, 0, 0.3, 1.2),       # D-
+            _smd_pad("A12", 3.25, 0, 0.6, 1.2),     # GND
+            # Bottom row SMD
+            _smd_pad("B1", -3.25, -0.8, 0.6, 1.2),  # GND
+            _smd_pad("B4", -2.25, -0.8, 0.6, 1.2),  # VBUS
+            _smd_pad("B5", -0.25, -0.8, 0.3, 1.2),  # CC2
+            _smd_pad("B6", 0.25, -0.8, 0.3, 1.2),   # D+
+            _smd_pad("B7", 1.0, -0.8, 0.3, 1.2),    # D-
+            _smd_pad("B12", 3.25, -0.8, 0.6, 1.2),  # GND
+            # Shield/mount thru-hole
+            _thru_pad("S1", -4.32, -1.5, 1.0, 0.7),
+            _thru_pad("S2", 4.32, -1.5, 1.0, 0.7),
+            _thru_pad("S3", -4.32, -5.0, 1.0, 0.7),
+            _thru_pad("S4", 4.32, -5.0, 1.0, 0.7),
+        ],
+        "courtyard": {"x": -5.0, "y": -6.0, "w": 10.0, "h": 7.5},
+        "silk": "J",
+    },
+    # 6x6mm tactile switch
+    "switch": {
+        "pads": [
+            _thru_pad("1", -3.25, 0, 1.6, 1.0),
+            _thru_pad("2", 3.25, 0, 1.6, 1.0),
+        ],
+        "courtyard": {"x": -4.0, "y": -3.5, "w": 8.0, "h": 7.0},
+        "silk": "SW",
+    },
+    # 1x20 pin header (vertical, 2.54mm pitch)
+    "pin_header_20": {
+        "pads": [_thru_pad(str(i+1), 0, i * 2.54, 1.7, 1.0) for i in range(20)],
+        "courtyard": {"x": -1.5, "y": -1.27, "w": 3.0, "h": 20 * 2.54},
+        "silk": "J",
+    },
+    # ESP32-S3-WROOM-1 module footprint (18x25.5mm)
+    # 41 pads: 39 edge pads + 1 GND pad (large center pad)
+    "esp32s3": {
+        "pads": (
+            # Left side (pin 1-14): bottom to top
+            [_smd_pad(str(i+1), -9.0, 10.75 - i * 1.27, 1.5, 0.7) for i in range(14)] +
+            # Bottom side (pin 15-24): left to right
+            [_smd_pad(str(i+15), -7.5 + i * 1.27, -12.25, 0.7, 1.5) for i in range(10)] +
+            # Right side (pin 25-38): bottom to top
+            [_smd_pad(str(i+25), 9.0, -10.75 + i * 1.27, 1.5, 0.7) for i in range(14)] +
+            # Top center (pin 39): antenna keep-out side
+            [_smd_pad("39", 0, 12.25, 0.7, 1.5)] +
+            # Large center GND pad
+            [_smd_pad("GND", 0, -2.0, 6.0, 6.0)]
+        ),
+        "courtyard": {"x": -10.0, "y": -13.5, "w": 20.0, "h": 27.0},
+        "silk": "U",
     },
 }
 
@@ -69,15 +168,48 @@ PIN_TO_PAD = {
     "led": {"K": "1", "A": "2"},
     "diode": {"K": "1", "A": "2"},
     "voltage_source": {"+": "1", "-": "2"},
+    # SMD versions use same pin mapping
+    "resistor_0603": {"1": "1", "2": "2"},
+    "capacitor_0603": {"1": "1", "2": "2"},
+    "led_0603": {"K": "1", "A": "2"},
+    "switch": {"1": "1", "2": "2"},
+    # SOT-223 (AMS1117): pin names map to pad numbers
+    "ams1117": {"GND": "1", "VOUT": "2", "VIN": "3", "TAB": "4"},
+    # SOT-23-6 (USBLC6-2SC6)
+    "usblc6": {"IO1_A": "1", "GND": "2", "IO2_A": "3",
+               "IO2_B": "4", "VBUS": "5", "IO1_B": "6"},
+    # USB-C: pin name -> pad number mapping
+    "usb_c": {
+        "GND_A1": "A1", "VBUS_A": "A4", "CC1": "A5", "DP_A": "A6", "DN_A": "A7", "GND_A12": "A12",
+        "GND_B1": "B1", "VBUS_B": "B4", "CC2": "B5", "DP_B": "B6", "DN_B": "B7", "GND_B12": "B12",
+        "SHIELD1": "S1", "SHIELD2": "S2", "SHIELD3": "S3", "SHIELD4": "S4",
+    },
+    # 1x20 pin header: pin names are "1" through "20"
+    "pin_header_20": {str(i+1): str(i+1) for i in range(20)},
+    # ESP32-S3 module: 41 pins — pin name matches pad number
+    "esp32s3": {str(i+1): str(i+1) for i in range(39)},
 }
+# Add ESP32 GND pad
+PIN_TO_PAD["esp32s3"]["GND"] = "GND"
+
+
+def _get_footprint_kind(comp: Component) -> str:
+    """Determine which footprint definition to use for a component."""
+    # If component has an explicit footprint hint, use it
+    if comp.footprint and comp.footprint in FOOTPRINTS:
+        return comp.footprint
+    # Otherwise map by kind
+    return comp.kind
 
 
 def export_pcb(circuit: Circuit, output_path: str,
                board_width: float = 50.0, board_height: float = 50.0,
-               traces: list[dict] = None) -> str:
+               traces: list[dict] = None,
+               placement: dict[str, tuple[float, float]] = None) -> str:
     """Export circuit to a KiCad PCB file with components placed in a grid.
 
     traces: optional list of {"net": name, "layer": layer, "width": mm, "points": [(x,y),...]}
+    placement: optional dict of ref -> (x, y) for custom placement
     """
 
     board_uuid = _uuid()
@@ -90,23 +222,32 @@ def export_pcb(circuit: Circuit, output_path: str,
         net_section += f'  (net {i} "{name}")\n'
         net_map[name] = i
 
-    # Place footprints in a grid
+    # Place footprints
     footprint_sections = []
     start_x, start_y = 120.0, 80.0
     cols = 4
 
-    for idx, (ref, comp) in enumerate(circuit.components.items()):
-        col = idx % cols
-        row = idx // cols
-        cx = start_x + col * COMP_SPACING
-        cy = start_y + row * COMP_SPACING
+    pcb_idx = 0
+    for ref, comp in circuit.components.items():
+        if comp.simulation_only:
+            continue
 
-        fp_def = FOOTPRINTS.get(comp.kind)
+        if placement and ref in placement:
+            cx, cy = placement[ref]
+        else:
+            col = pcb_idx % cols
+            row = pcb_idx // cols
+            cx = start_x + col * COMP_SPACING
+            cy = start_y + row * COMP_SPACING
+        pcb_idx += 1
+
+        fp_kind = _get_footprint_kind(comp)
+        fp_def = FOOTPRINTS.get(fp_kind)
         if not fp_def:
             continue
 
-        pin_map = PIN_TO_PAD.get(comp.kind, {})
-        fp = _build_footprint(ref, comp, fp_def, pin_map, cx, cy, net_map)
+        pin_map = PIN_TO_PAD.get(fp_kind, {})
+        fp = _build_footprint(ref, comp, fp_def, pin_map, cx, cy, net_map, fp_kind)
         footprint_sections.append(fp)
 
     # Build trace segments
@@ -214,8 +355,11 @@ def export_pcb(circuit: Circuit, output_path: str,
 
 
 def _build_footprint(ref: str, comp: Component, fp_def: dict, pin_map: dict,
-                     cx: float, cy: float, net_map: dict) -> str:
+                     cx: float, cy: float, net_map: dict,
+                     fp_kind: str = None) -> str:
     """Build a footprint S-expression for placement in the PCB."""
+    if fp_kind is None:
+        fp_kind = comp.kind
 
     pads = []
     for pad_def in fp_def["pads"]:
@@ -229,14 +373,33 @@ def _build_footprint(ref: str, comp: Component, fp_def: dict, pin_map: dict,
         net_idx = net_map.get(net_name, 0)
         net_str = f'"{net_name}"' if net_name else '""'
 
-        pads.append(f"""    (pad "{pad_def["number"]}" thru_hole circle (at {pad_def["x"]} {pad_def["y"]}) (size {pad_def["size"]} {pad_def["size"]}) (drill {pad_def["drill"]})
-      (layers "*.Cu" "*.Mask")
+        pad_type = pad_def.get("type", "thru_hole")
+        pad_shape = pad_def.get("shape", "circle")
+        layers = pad_def.get("layers", '"*.Cu" "*.Mask"')
+
+        if pad_type == "smd":
+            # SMD pad with potentially rectangular size
+            size = pad_def["size"]
+            if isinstance(size, tuple):
+                sx, sy = size
+            else:
+                sx = sy = size
+            pads.append(f"""    (pad "{pad_def["number"]}" smd {pad_shape} (at {pad_def["x"]} {pad_def["y"]}) (size {sx} {sy})
+      (layers {layers})
+      (net {net_idx} {net_str})
+      (uuid {_uuid()}))""")
+        else:
+            # Through-hole pad
+            size = pad_def["size"]
+            drill = pad_def["drill"]
+            pads.append(f"""    (pad "{pad_def["number"]}" thru_hole {pad_shape} (at {pad_def["x"]} {pad_def["y"]}) (size {size} {size}) (drill {drill})
+      (layers {layers})
       (net {net_idx} {net_str})
       (uuid {_uuid()}))""")
 
     cy_def = fp_def["courtyard"]
 
-    return f"""  (footprint "pcb_llm:{comp.kind}" (layer "F.Cu")
+    return f"""  (footprint "pcb_llm:{fp_kind}" (layer "F.Cu")
     (uuid {_uuid()})
     (at {cx} {cy})
     (property "Reference" "{ref}" (at 0 -2.5) (layer "F.SilkS") (uuid {_uuid()})
@@ -262,12 +425,6 @@ def run_freerouting(pcb_path: str, output_dir: str = None) -> dict:
     dsn_path = os.path.join(output_dir, "circuit.dsn")
     ses_path = os.path.join(output_dir, "circuit.ses")
 
-    # Step 1: Export .kicad_pcb → .dsn via kicad-cli
-    # KiCad doesn't have direct DSN export via CLI, so we use pcbnew Python
-    # For now, try kicad-cli pcb export
-    # Actually kicad-cli doesn't export DSN. We need to write DSN ourselves or use pcbnew scripting.
-    # Let's try the pcbnew Python module first.
-
     result = {
         "success": False,
         "pcb_path": pcb_path,
@@ -285,7 +442,7 @@ def run_freerouting(pcb_path: str, output_dir: str = None) -> dict:
         result["errors"].append(f"DSN export failed: {e}")
         return result
 
-    # Step 2: Run Freerouting headless
+    # Run Freerouting headless
     cmd = [
         "freerouting",
         "-de", dsn_path,
@@ -295,7 +452,7 @@ def run_freerouting(pcb_path: str, output_dir: str = None) -> dict:
     ]
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         result["freerouting_stdout"] = proc.stdout
         result["freerouting_stderr"] = proc.stderr
 
@@ -305,7 +462,7 @@ def run_freerouting(pcb_path: str, output_dir: str = None) -> dict:
             result["errors"].append("Freerouting did not produce output .ses file")
             result["errors"].append(proc.stderr[-500:] if proc.stderr else "no stderr")
     except subprocess.TimeoutExpired:
-        result["errors"].append("Freerouting timed out after 120s")
+        result["errors"].append("Freerouting timed out after 300s")
     except Exception as e:
         result["errors"].append(f"Freerouting failed: {e}")
 
@@ -317,14 +474,10 @@ def parse_ses_routes(ses_path: str) -> list[dict]:
     with open(ses_path) as f:
         content = f.read()
 
-    # Auto-detect scale: find a placement coordinate and compare to known position.
-    # Freerouting outputs in nanometers regardless of the resolution field.
-    # Detect by looking at the routes resolution or by checking coordinate magnitude.
+    # Auto-detect scale
     place_match = re.search(r'\(place \w+ (\d+) (\d+)', content)
     if place_match:
         raw_x = int(place_match.group(1))
-        # Our components start at x=120mm. If raw_x is ~120000000, scale is 1e6.
-        # If raw_x is ~120000, scale is 1e3.
         if raw_x > 10_000_000:
             scale = 1_000_000  # nanometers
         elif raw_x > 100_000:
@@ -334,7 +487,7 @@ def parse_ses_routes(ses_path: str) -> list[dict]:
     else:
         scale = 1_000_000  # default to nm
 
-    # Collect all traces per net, merging layers to avoid via issues
+    # Collect all traces per net
     raw_traces = []
     net_blocks = re.findall(
         r'\(net\s+(\S+)\s*((?:\s*\(wire\s*\(path.*?\)\s*\))+)\s*\)',
@@ -367,12 +520,10 @@ def parse_ses_routes(ses_path: str) -> list[dict]:
                     "points": points,
                 })
 
-    # Deduplicate: remove traces that are exact reverses of another trace
-    # and merge multi-layer traces onto B.Cu (since we don't support vias yet)
+    # Deduplicate
     seen = set()
     traces = []
     for t in raw_traces:
-        # Create a canonical key: sorted endpoints
         pts = tuple(t["points"])
         pts_rev = tuple(reversed(t["points"]))
         key = (t["net"], min(pts, pts_rev))
@@ -389,9 +540,10 @@ def parse_ses_routes(ses_path: str) -> list[dict]:
 
 
 def full_pipeline(circuit: Circuit, output_dir: str,
-                  board_width: float = 50.0, board_height: float = 50.0) -> dict:
+                  board_width: float = 50.0, board_height: float = 50.0,
+                  placement: dict[str, tuple[float, float]] = None) -> dict:
     """
-    Full pipeline: export unrouted PCB → DSN → freerouting → parse SES → routed PCB.
+    Full pipeline: export unrouted PCB -> DSN -> freerouting -> parse SES -> routed PCB.
     Returns dict with all results and paths.
     """
     os.makedirs(output_dir, exist_ok=True)
@@ -399,7 +551,8 @@ def full_pipeline(circuit: Circuit, output_dir: str,
 
     # Step 1: Export unrouted PCB
     unrouted_path = os.path.join(output_dir, "unrouted.kicad_pcb")
-    export_pcb(circuit, unrouted_path, board_width, board_height)
+    export_pcb(circuit, unrouted_path, board_width, board_height,
+               placement=placement)
     result["steps"]["export_unrouted"] = {"path": unrouted_path, "ok": True}
 
     # Step 2: Generate DSN
@@ -418,7 +571,7 @@ def full_pipeline(circuit: Circuit, output_dir: str,
     cmd = ["freerouting", "-de", dsn_path, "-do", ses_path,
            "-mp", "20", "--gui.enabled=false"]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
         ok = os.path.exists(ses_path)
         result["steps"]["freerouting"] = {
             "path": ses_path, "ok": ok,
@@ -437,7 +590,8 @@ def full_pipeline(circuit: Circuit, output_dir: str,
 
     # Step 5: Export routed PCB with traces
     routed_path = os.path.join(output_dir, "routed.kicad_pcb")
-    export_pcb(circuit, routed_path, board_width, board_height, traces=traces)
+    export_pcb(circuit, routed_path, board_width, board_height,
+               traces=traces, placement=placement)
     result["steps"]["export_routed"] = {"path": routed_path, "ok": True}
 
     # Step 6: DRC check
@@ -449,26 +603,71 @@ def full_pipeline(circuit: Circuit, output_dir: str,
             capture_output=True, text=True, timeout=30
         )
         drc_text = drc_proc.stdout + drc_proc.stderr
-        violations = drc_text.count("violation")
-        unconnected = "0 unconnected" in drc_text or "Found 0 unconnected" in drc_text
+
+        error_violations = 0
+        unconnected_items = 0
+        if os.path.exists(drc_json):
+            try:
+                with open(drc_json) as f:
+                    drc_data = json.load(f)
+                error_violations = sum(
+                    1 for v in drc_data.get("violations", [])
+                    if v.get("severity", "").lower() == "error"
+                )
+                unconnected_items = sum(
+                    1 for u in drc_data.get("unconnected_items", [])
+                    if u.get("severity", "").lower() == "error"
+                )
+            except Exception:
+                # Keep fallback behavior from CLI text when JSON can't be parsed.
+                error_violations = 1 if "error" in drc_text.lower() else 0
+                unconnected_items = 0 if "0 unconnected" in drc_text else 1
+
         result["steps"]["drc"] = {
             "path": drc_json, "output": drc_text.strip(),
-            "ok": "0 violations" in drc_text and unconnected,
+            "ok": drc_proc.returncode == 0 and error_violations == 0 and unconnected_items == 0,
         }
     except Exception as e:
         result["steps"]["drc"] = {"error": str(e), "ok": False}
 
-    # Step 7: Render outputs
+    # Step 7: Gerber export (manufacturing files)
+    gerber_dir = os.path.join(output_dir, "gerber")
+    os.makedirs(gerber_dir, exist_ok=True)
+    try:
+        subprocess.run(
+            ["kicad-cli", "pcb", "export", "gerbers",
+             "--layers", "F.Cu,B.Cu,F.SilkS,B.SilkS,F.Mask,B.Mask,Edge.Cuts",
+             "-o", gerber_dir + "/", routed_path],
+            capture_output=True, text=True, timeout=30
+        )
+        subprocess.run(
+            ["kicad-cli", "pcb", "export", "drill",
+             "-o", gerber_dir + "/", routed_path],
+            capture_output=True, text=True, timeout=30
+        )
+        gerber_files = [f for f in os.listdir(gerber_dir) if not f.startswith('.')]
+        result["steps"]["gerber"] = {
+            "path": gerber_dir, "file_count": len(gerber_files),
+            "ok": len(gerber_files) >= 5,
+        }
+    except Exception as e:
+        result["steps"]["gerber"] = {"error": str(e), "ok": False}
+
+    # Step 8: Render outputs
     renders = {}
     for fmt, cmd_args in [
         ("svg", ["kicad-cli", "pcb", "export", "svg",
                  "--layers", "F.Cu,B.Cu,Edge.Cuts,F.SilkS",
                  "--mode-single", "--exclude-drawing-sheet",
                  "-o", os.path.join(output_dir, "routed.svg"), routed_path]),
-        ("3d_png", ["kicad-cli", "pcb", "render",
-                    "-o", os.path.join(output_dir, "routed_3d.png"),
+        ("3d_top", ["kicad-cli", "pcb", "render",
+                    "-o", os.path.join(output_dir, "routed_3d_top.png"),
                     "--side", "top", "--quality", "basic",
                     "--background", "opaque", "-w", "1200", routed_path]),
+        ("3d_bottom", ["kicad-cli", "pcb", "render",
+                       "-o", os.path.join(output_dir, "routed_3d_bottom.png"),
+                       "--side", "bottom", "--quality", "basic",
+                       "--background", "opaque", "-w", "1200", routed_path]),
     ]:
         try:
             subprocess.run(cmd_args, capture_output=True, text=True, timeout=30)
@@ -488,27 +687,15 @@ def full_pipeline(circuit: Circuit, output_dir: str,
 def _pcb_to_dsn_simple(pcb_path: str) -> str:
     """
     Generate a minimal Specctra DSN file from our PCB.
-    This is a simplified version - real DSN export is complex.
-    We parse our own PCB file since we know its structure.
+    Supports both through-hole and SMD footprints.
     """
-    # For MVP: read the PCB we just generated and convert to DSN
-    # This is a simplified DSN that freerouting can understand
-
     with open(pcb_path) as f:
         pcb_content = f.read()
 
-    # Parse nets, components, pads from our known format
-    # Since we generated the PCB ourselves, we know the structure
-    import re
+    # Extract top-level net declarations only (not pad-level net references)
+    nets = re.findall(r'^\s{2}\(net (\d+) "([^"]*)"\)', pcb_content, re.MULTILINE)
 
-    # Extract nets
-    nets = re.findall(r'\(net (\d+) "([^"]*)"\)', pcb_content)
-
-    # Extract footprints with positions and pads
-    # This is simplified - we'll build DSN from our Circuit object instead
-    # For now, create a minimal DSN
-
-    # Board outline - find Edge.Cuts rect
+    # Board outline
     rect_match = re.search(r'gr_rect \(start ([\d.]+) ([\d.]+)\) \(end ([\d.]+) ([\d.]+)\)', pcb_content)
     if rect_match:
         bx1 = float(rect_match.group(1))
@@ -518,8 +705,6 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
     else:
         bx1, by1, bx2, by2 = 100, 70, 170, 140
 
-    # Convert mm to DSN units (10 * mils, i.e. 1mm = 393.7 units... actually DSN uses mils * 10 = 0.1mil)
-    # Freerouting uses resolution 1000 per mm typically
     RES = 1000  # units per mm
 
     def mm(v): return int(v * RES)
@@ -562,17 +747,16 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
     # Placement section
     dsn_lines.append('  (placement')
 
-    # Parse footprints
-    fp_pattern = re.compile(
-        r'footprint "pcb_llm:(\w+)".*?\(at ([\d.]+) ([\d.]+)\).*?'
-        r'property "Reference" "(\w+)".*?'
-        r'property "Value" "([^"]*)"',
+    # Parse footprints — handle both thru_hole and smd pads
+    pad_pattern_thru = re.compile(
+        r'\(pad "([^"]+)" thru_hole (\w+) \(at ([\d.e-]+) ([\d.e-]+)\) '
+        r'\(size ([\d.e-]+) ([\d.e-]+)\) \(drill ([\d.e-]+)\).*?'
+        r'\(net (\d+) "([^"]*)"\)',
         re.DOTALL
     )
-
-    pad_pattern = re.compile(
-        r'\(pad "(\d+)" thru_hole circle \(at ([\d.]+) ([\d.]+)\) '
-        r'\(size ([\d.]+) ([\d.]+)\) \(drill ([\d.]+)\).*?'
+    pad_pattern_smd = re.compile(
+        r'\(pad "([^"]+)" smd (\w+) \(at ([\d.e-]+) ([\d.e-]+)\) '
+        r'\(size ([\d.e-]+) ([\d.e-]+)\).*?'
         r'\(net (\d+) "([^"]*)"\)',
         re.DOTALL
     )
@@ -580,12 +764,13 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
     # Find all footprints
     fp_blocks = pcb_content.split('(footprint "pcb_llm:')[1:]
 
-    component_pads = {}  # ref -> [(pad_num, net_name, rel_x, rel_y, size, drill)]
+    component_pads = {}  # ref -> [(pad_num, net_name, rel_x, rel_y, size_x, size_y, drill, is_smd)]
+    fp_kinds = {}  # ref -> kind
 
     for block in fp_blocks:
         kind_match = re.match(r'(\w+)', block)
-        at_match = re.search(r'\(at ([\d.]+) ([\d.]+)\)', block)
-        ref_match = re.search(r'property "Reference" "(\w+)"', block)
+        at_match = re.search(r'\(at ([\d.e-]+) ([\d.e-]+)\)', block)
+        ref_match = re.search(r'property "Reference" "([^"]+)"', block)
 
         if not (kind_match and at_match and ref_match):
             continue
@@ -594,6 +779,7 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
         fx = float(at_match.group(1))
         fy = float(at_match.group(2))
         ref = ref_match.group(1)
+        fp_kinds[ref] = kind
 
         dsn_lines.append(f'    (component "pcb_llm:{kind}"')
         dsn_lines.append(f'      (place {ref} {mm(fx)} {mm(fy)} front 0)')
@@ -601,21 +787,31 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
 
         # Collect pads
         component_pads[ref] = []
-        for pm in pad_pattern.finditer(block):
+        for pm in pad_pattern_thru.finditer(block):
             pad_num = pm.group(1)
-            px = float(pm.group(2))
-            py = float(pm.group(3))
-            size = float(pm.group(4))
-            drill = float(pm.group(6))
-            net_idx = int(pm.group(7))
+            px = float(pm.group(3))
+            py = float(pm.group(4))
+            sx = float(pm.group(5))
+            sy = float(pm.group(6))
+            drill = float(pm.group(7))
+            net_name = pm.group(9)
+            component_pads[ref].append((pad_num, net_name, px, py, sx, sy, drill, False))
+
+        for pm in pad_pattern_smd.finditer(block):
+            pad_num = pm.group(1)
+            px = float(pm.group(3))
+            py = float(pm.group(4))
+            sx = float(pm.group(5))
+            sy = float(pm.group(6))
             net_name = pm.group(8)
-            component_pads[ref].append((pad_num, net_name, px, py, size, drill))
+            component_pads[ref].append((pad_num, net_name, px, py, sx, sy, 0, True))
 
     dsn_lines.append('  )')
 
-    # Library section - define padstacks
+    # Library section
     dsn_lines.append('  (library')
-    # Define images (footprints)
+
+    # Define images (footprints) — group by kind
     seen_kinds = set()
     for block in fp_blocks:
         kind_match = re.match(r'(\w+)', block)
@@ -632,17 +828,57 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
 
         dsn_lines.append(f'    (image "pcb_llm:{kind}"')
         for pad_def in fp_def["pads"]:
-            dsn_lines.append(f'      (pin "Round[A]Pad_{int(pad_def["size"]*1000)}_um" {pad_def["number"]} {mm(pad_def["x"])} {mm(pad_def["y"])})')
+            pad_type = pad_def.get("type", "thru_hole")
+            size = pad_def["size"]
+            if isinstance(size, tuple):
+                sx, sy = size
+            else:
+                sx = sy = size
+            size_um = int(max(sx, sy) * 1000)
+
+            if pad_type == "smd":
+                padstack_name = f"SMDPad_{int(sx*1000)}x{int(sy*1000)}_um"
+            else:
+                padstack_name = f"Round[A]Pad_{size_um}_um"
+
+            dsn_lines.append(f'      (pin "{padstack_name}" {pad_def["number"]} {mm(pad_def["x"])} {mm(pad_def["y"])})')
         dsn_lines.append(f'    )')
 
-    # Padstack definitions
-    for size in [1600, 1700]:
-        dsn_lines.append(f'    (padstack "Round[A]Pad_{size}_um"')
-        dsn_lines.append(f'      (shape (circle F.Cu {size}))')
-        dsn_lines.append(f'      (shape (circle B.Cu {size}))')
-        dsn_lines.append(f'      (attach off)')
-        dsn_lines.append(f'    )')
+    # Padstack definitions — collect unique padstacks
+    padstack_set = set()
+    for kind in seen_kinds:
+        fp_def = FOOTPRINTS.get(kind)
+        if not fp_def:
+            continue
+        for pad_def in fp_def["pads"]:
+            pad_type = pad_def.get("type", "thru_hole")
+            size = pad_def["size"]
+            if isinstance(size, tuple):
+                sx, sy = size
+            else:
+                sx = sy = size
 
+            if pad_type == "smd":
+                padstack_set.add(("smd", int(sx*1000), int(sy*1000)))
+            else:
+                padstack_set.add(("thru", int(sx*1000), int(pad_def["drill"]*1000)))
+
+    for ps in sorted(padstack_set):
+        if ps[0] == "thru":
+            size_um = ps[1]
+            dsn_lines.append(f'    (padstack "Round[A]Pad_{size_um}_um"')
+            dsn_lines.append(f'      (shape (circle F.Cu {size_um}))')
+            dsn_lines.append(f'      (shape (circle B.Cu {size_um}))')
+            dsn_lines.append(f'      (attach off)')
+            dsn_lines.append(f'    )')
+        else:
+            sx_um, sy_um = ps[1], ps[2]
+            dsn_lines.append(f'    (padstack "SMDPad_{sx_um}x{sy_um}_um"')
+            dsn_lines.append(f'      (shape (rect F.Cu {-sx_um//2} {-sy_um//2} {sx_um//2} {sy_um//2}))')
+            dsn_lines.append(f'      (attach off)')
+            dsn_lines.append(f'    )')
+
+    # Via padstack
     dsn_lines.append(f'    (padstack "Via[0-1]_800:400_um"')
     dsn_lines.append(f'      (shape (circle F.Cu 800))')
     dsn_lines.append(f'      (shape (circle B.Cu 800))')
@@ -659,7 +895,7 @@ def _pcb_to_dsn_simple(pcb_path: str) -> str:
         # Find pins connected to this net
         pins = []
         for ref, pads in component_pads.items():
-            for pad_num, pnet, px, py, sz, dr in pads:
+            for pad_num, pnet, px, py, sx, sy, dr, is_smd in pads:
                 if pnet == net_name:
                     pins.append(f'{ref}-{pad_num}')
 

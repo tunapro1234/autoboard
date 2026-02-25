@@ -1,66 +1,65 @@
-"""
-MVP Test: Simple LED circuit.
+"""Regression tests for the simple LED reference circuit."""
 
-Circuit: 5V -> 330Ω resistor -> LED -> GND
-
-Expected:
-- LED forward voltage: ~1.8-2.2V
-- Current through LED: ~9-10mA
-- Voltage across resistor: ~2.8-3.2V
-"""
-
-import sys
 import os
+import shutil
+import subprocess
+import sys
+
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src import Circuit, run_simulation, circuit_to_spice, export_schematic
+from src import Circuit, circuit_to_spice, export_schematic, run_simulation
 
 
-def test_led_circuit():
-    # 1. Define circuit
+def _build_led_circuit() -> Circuit:
     c = Circuit("Simple LED")
     c.add_voltage_source("VCC", "GND", "5")
     c.add_resistor("VCC", "LED_A", "330")
     c.add_led("LED_A", "GND")
+    return c
 
-    print("=== Circuit Summary ===")
-    print(c.summary())
 
-    # 2. Generate SPICE netlist
+def test_led_circuit_simulation():
+    if shutil.which("ngspice") is None:
+        pytest.skip("ngspice is not installed")
+
+    c = _build_led_circuit()
     spice = circuit_to_spice(c)
-    print("\n=== SPICE Netlist ===")
-    print(spice)
+    assert "D1 2 0 LED" in spice
+    assert ".MODEL LED" in spice
 
-    # 3. Run simulation
-    print("\n=== Running Simulation ===")
     result = run_simulation(c)
-    print(f"Success: {result.success}")
-    print(f"Node voltages: {result.node_voltages}")
-    print(f"Branch currents: {result.branch_currents}")
+    assert result.success, f"Simulation failed: {result.errors}"
 
-    if result.errors:
-        print(f"Errors: {result.errors}")
+    led_v = result.node_voltages.get("LED_A", result.node_voltages.get("V(2)"))
+    assert led_v is not None, f"No LED node voltage parsed: {result.node_voltages}"
+    assert 1.5 < led_v < 2.5
 
-    # 4. Validate results
-    if result.node_voltages:
-        print("\n=== Validation ===")
-        # Find LED anode voltage (should be ~2V for LED forward voltage)
-        for node, voltage in result.node_voltages.items():
-            print(f"  {node} = {voltage:.4f}V")
-
-    # 5. Export to KiCad schematic
-    output_dir = os.path.join(os.path.dirname(__file__), "..", "output")
-    os.makedirs(output_dir, exist_ok=True)
-    sch_path = os.path.join(output_dir, "led_circuit.kicad_sch")
-    export_schematic(c, sch_path)
-    print(f"\n=== KiCad Schematic exported to: {sch_path} ===")
-
-    # 6. Run ERC if kicad-cli available
-    erc_result = os.popen(f"kicad-cli sch erc --format json '{sch_path}' 2>&1").read()
-    print(f"\n=== ERC Result ===\n{erc_result[:500]}")
-
-    print("\n=== DONE ===")
+    # ngspice reports source branch current as v1#branch; parser should map it.
+    assert "V1" in result.branch_currents
+    assert result.branch_currents["V1"] < 0
 
 
-if __name__ == "__main__":
-    test_led_circuit()
+def test_led_circuit_kicad_export_loads(tmp_path):
+    if shutil.which("kicad-cli") is None:
+        pytest.skip("kicad-cli is not installed")
+
+    c = _build_led_circuit()
+    sch_path = tmp_path / "led_circuit.kicad_sch"
+    export_schematic(c, str(sch_path))
+
+    proc = subprocess.run(
+        [
+            "kicad-cli", "sch", "erc", "--format", "json",
+            "-o", str(tmp_path / "erc.json"),
+            str(sch_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    out = (proc.stdout or "") + (proc.stderr or "")
+    assert "Failed to load schematic" not in out
+    assert proc.returncode == 0, out
