@@ -1,0 +1,627 @@
+#!/usr/bin/env python3
+"""Stage-aware CLI orchestrator for board checks and routing retries."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from boards import get_example, list_example_names
+from src.circuit import Circuit
+from src.export_pcb import COMP_SPACING, FOOTPRINTS, PIN_TO_PAD, full_pipeline
+
+ROOT = Path(__file__).resolve().parent
+STATE_DIR = ROOT / ".autoboard"
+DEFAULT_CLEARANCE_MM = 0.2
+GRID_START_X = 120.0
+GRID_START_Y = 80.0
+GRID_COLS = 4
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _state_path(example: str) -> Path:
+    return STATE_DIR / f"{example}.json"
+
+
+def _default_state(example: str) -> dict:
+    return {
+        "example": example,
+        "updated_at": _utc_now(),
+        "last_status": "idle",
+        "board_hash": None,
+        "attempt_count": 0,
+        "last_failure": None,
+        "last_success": None,
+        "stages": {
+            "checks": {"status": "pending", "details": [], "warnings": []},
+            "export": {"status": "pending", "details": []},
+            "route": {"status": "pending", "details": []},
+            "drc": {"status": "pending", "details": []},
+            "pack": {"status": "pending", "details": []},
+        },
+        "artifacts": {},
+    }
+
+
+def _load_state(example: str) -> dict:
+    path = _state_path(example)
+    if not path.exists():
+        return _default_state(example)
+    with path.open() as f:
+        data = json.load(f)
+    return data
+
+
+def _save_state(example: str, state: dict):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    state["updated_at"] = _utc_now()
+    path = _state_path(example)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _json_out(payload: dict, exit_code: int):
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return exit_code
+
+
+def _footprint_kind(comp) -> str:
+    if comp.footprint and comp.footprint in FOOTPRINTS:
+        return comp.footprint
+    return comp.kind
+
+
+def _resolved_positions(circuit: Circuit, placement: dict[str, tuple[float, float]] | None) -> dict[str, tuple[float, float]]:
+    positions: dict[str, tuple[float, float]] = {}
+    idx = 0
+    for ref, comp in circuit.components.items():
+        if comp.simulation_only:
+            continue
+
+        if placement and ref in placement:
+            positions[ref] = placement[ref]
+        else:
+            col = idx % GRID_COLS
+            row = idx // GRID_COLS
+            positions[ref] = (GRID_START_X + col * COMP_SPACING, GRID_START_Y + row * COMP_SPACING)
+        idx += 1
+    return positions
+
+
+def _bbox(cx: float, cy: float, courtyard: dict) -> tuple[float, float, float, float]:
+    x1 = cx + courtyard["x"]
+    y1 = cy + courtyard["y"]
+    x2 = x1 + courtyard["w"]
+    y2 = y1 + courtyard["h"]
+    return (min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2))
+
+
+def _boxes_collide(a: tuple[float, float, float, float],
+                   b: tuple[float, float, float, float],
+                   clearance: float) -> bool:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    if ax2 + clearance <= bx1:
+        return False
+    if bx2 + clearance <= ax1:
+        return False
+    if ay2 + clearance <= by1:
+        return False
+    if by2 + clearance <= ay1:
+        return False
+    return True
+
+
+def _component_net_view(circuit: Circuit) -> dict[str, list[tuple[str, str]]]:
+    expected: dict[str, list[tuple[str, str]]] = {}
+    for ref, comp in circuit.components.items():
+        if comp.simulation_only:
+            continue
+        for pin, net in comp.pins.items():
+            expected.setdefault(net, []).append((ref, pin))
+    for net_name in expected:
+        expected[net_name] = sorted(expected[net_name])
+    return expected
+
+
+def _net_registry_view(circuit: Circuit) -> dict[str, list[tuple[str, str]]]:
+    actual: dict[str, list[tuple[str, str]]] = {}
+    for net_name, net in circuit.nets.items():
+        filtered = []
+        for ref, pin in net.components:
+            comp = circuit.components.get(ref)
+            if comp is None or comp.simulation_only:
+                continue
+            filtered.append((ref, pin))
+        if filtered:
+            actual[net_name] = sorted(filtered)
+    return actual
+
+
+def _validate_nets(circuit: Circuit) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    for ref, comp in circuit.components.items():
+        if comp.simulation_only:
+            continue
+        fp_kind = _footprint_kind(comp)
+        if fp_kind not in FOOTPRINTS:
+            errors.append(f"{ref}: footprint tanimsiz ({fp_kind})")
+            continue
+
+        pin_map = PIN_TO_PAD.get(comp.kind, PIN_TO_PAD.get(fp_kind, {}))
+        if not pin_map:
+            errors.append(f"{ref}: pin->pad map tanimsiz ({comp.kind}/{fp_kind})")
+            continue
+
+        for pin in comp.pins:
+            if pin not in pin_map:
+                errors.append(f"{ref}: pin mapte yok ({pin})")
+
+    expected = _component_net_view(circuit)
+    actual = _net_registry_view(circuit)
+
+    if set(expected) != set(actual):
+        missing = sorted(set(expected) - set(actual))
+        extra = sorted(set(actual) - set(expected))
+        if missing:
+            errors.append(f"net registry eksik netler: {', '.join(missing)}")
+        if extra:
+            errors.append(f"net registry fazladan netler: {', '.join(extra)}")
+
+    for net_name in sorted(set(expected) & set(actual)):
+        if expected[net_name] != actual[net_name]:
+            errors.append(f"net uyusmazligi: {net_name}")
+
+    for net_name, conns in sorted(expected.items()):
+        if len(conns) < 2:
+            warnings.append(f"dangling net: {net_name} ({len(conns)} baglanti)")
+
+    return errors, warnings
+
+
+def _validate_placement(circuit: Circuit,
+                        placement: dict[str, tuple[float, float]] | None,
+                        board_size: tuple[float, float],
+                        clearance: float) -> tuple[list[str], list[str]]:
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    board_w, board_h = board_size
+    left = GRID_START_X - 10.0
+    top = GRID_START_Y - 10.0
+    right = GRID_START_X + board_w
+    bottom = GRID_START_Y + board_h
+
+    positions = _resolved_positions(circuit, placement)
+    boxes: dict[str, tuple[float, float, float, float]] = {}
+
+    for ref, comp in circuit.components.items():
+        if comp.simulation_only:
+            continue
+        fp_kind = _footprint_kind(comp)
+        fp_def = FOOTPRINTS.get(fp_kind)
+        if fp_def is None:
+            errors.append(f"{ref}: footprint bulunamadi ({fp_kind})")
+            continue
+        if ref not in positions:
+            errors.append(f"{ref}: placement yok")
+            continue
+
+        cx, cy = positions[ref]
+        box = _bbox(cx, cy, fp_def["courtyard"])
+        boxes[ref] = box
+
+        x1, y1, x2, y2 = box
+        if x1 < left or y1 < top or x2 > right or y2 > bottom:
+            errors.append(
+                f"{ref}: board disina tasiyor "
+                f"(bbox={x1:.2f},{y1:.2f},{x2:.2f},{y2:.2f} "
+                f"board={left:.2f},{top:.2f},{right:.2f},{bottom:.2f})"
+            )
+
+    refs = sorted(boxes.keys())
+    for i, ref_a in enumerate(refs):
+        for ref_b in refs[i + 1:]:
+            if _boxes_collide(boxes[ref_a], boxes[ref_b], clearance):
+                errors.append(f"cakisma: {ref_a} <-> {ref_b}")
+
+    if placement:
+        missing_custom = sorted(
+            ref for ref, comp in circuit.components.items()
+            if not comp.simulation_only and ref not in placement
+        )
+        if missing_custom:
+            warnings.append(
+                "placement map eksik komponentler grid'e dustu: "
+                + ", ".join(missing_custom)
+            )
+
+    return errors, warnings
+
+
+def _build_fingerprint(circuit: Circuit,
+                       board_size: tuple[float, float],
+                       placement: dict[str, tuple[float, float]] | None) -> str:
+    comps = []
+    for ref in sorted(circuit.components.keys()):
+        comp = circuit.components[ref]
+        comps.append({
+            "ref": ref,
+            "kind": comp.kind,
+            "value": comp.value,
+            "unit": comp.unit,
+            "footprint": comp.footprint,
+            "simulation_only": comp.simulation_only,
+            "pins": {k: comp.pins[k] for k in sorted(comp.pins.keys())},
+        })
+
+    payload = {
+        "name": circuit.name,
+        "board_size": [board_size[0], board_size[1]],
+        "placement": {k: [v[0], v[1]] for k, v in sorted((placement or {}).items())},
+        "components": comps,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _run_checks(example: str, clearance_mm: float) -> tuple[dict, dict, str, str]:
+    spec = get_example(example)
+    circuit = spec.builder()
+    placement = spec.placement()
+    board_hash = _build_fingerprint(circuit, spec.board_size, placement)
+
+    net_errors, net_warnings = _validate_nets(circuit)
+    placement_errors, placement_warnings = _validate_placement(
+        circuit, placement, spec.board_size, clearance_mm
+    )
+
+    details = []
+    details.extend(net_errors)
+    details.extend(placement_errors)
+    warnings = []
+    warnings.extend(net_warnings)
+    warnings.extend(placement_warnings)
+
+    checks_ok = len(details) == 0
+    check_result = {
+        "ok": checks_ok,
+        "errors": details,
+        "warnings": warnings,
+        "net_error_count": len(net_errors),
+        "placement_error_count": len(placement_errors),
+    }
+    return check_result, {"circuit": circuit, "placement": placement, "board_size": spec.board_size}, board_hash, str(spec.name)
+
+
+def _set_stage(state: dict, stage: str, status: str, details: list[str] | None = None, warnings: list[str] | None = None):
+    entry = state["stages"].setdefault(stage, {})
+    entry["status"] = status
+    entry["updated_at"] = _utc_now()
+    if details is not None:
+        entry["details"] = details
+    if warnings is not None:
+        entry["warnings"] = warnings
+
+
+def _mark_downstream_pending(state: dict, start_stage: str):
+    order = ["checks", "export", "route", "drc", "pack"]
+    seen = False
+    for stage in order:
+        if stage == start_stage:
+            seen = True
+            continue
+        if seen:
+            _set_stage(state, stage, "pending", [])
+
+
+def cmd_status(args) -> int:
+    state = _load_state(args.example)
+    payload = {
+        "ok": True,
+        "action": "status",
+        "example": args.example,
+        "state": state,
+    }
+    return _json_out(payload, 0)
+
+
+def cmd_check(args) -> int:
+    state = _load_state(args.example)
+    state["attempt_count"] = int(state.get("attempt_count", 0)) + 1
+
+    check_result, meta, board_hash, board_name = _run_checks(args.example, args.clearance_mm)
+    state["board_hash"] = board_hash
+    state["board_name"] = board_name
+
+    if check_result["ok"]:
+        _set_stage(state, "checks", "pass", ["placement + nets kontrolu gecti"], check_result["warnings"])
+        _mark_downstream_pending(state, "checks")
+        state["last_status"] = "checks_passed"
+        _save_state(args.example, state)
+        payload = {
+            "ok": True,
+            "action": "check",
+            "example": args.example,
+            "board_hash": board_hash,
+            "checks": check_result,
+            "stages": state["stages"],
+        }
+        return _json_out(payload, 0)
+
+    failure = {
+        "hash": board_hash,
+        "stage": "checks",
+        "summary": "placement/net kontrolu basarisiz",
+        "details": check_result["errors"],
+        "warnings": check_result["warnings"],
+    }
+    state["last_failure"] = failure
+    state["last_status"] = "failed"
+    _set_stage(state, "checks", "fail", check_result["errors"], check_result["warnings"])
+    _mark_downstream_pending(state, "checks")
+    _save_state(args.example, state)
+
+    payload = {
+        "ok": False,
+        "action": "check",
+        "example": args.example,
+        "board_hash": board_hash,
+        "checks": check_result,
+        "failure": failure,
+        "stages": state["stages"],
+    }
+    return _json_out(payload, 1)
+
+
+def _pipeline_artifacts(output_dir: Path) -> dict:
+    names = [
+        "unrouted.kicad_pcb",
+        "circuit.dsn",
+        "circuit.ses",
+        "routed.kicad_pcb",
+        "drc_report.json",
+        "routed.svg",
+        "routed_3d_top.png",
+        "routed_3d_bottom.png",
+    ]
+    out = {}
+    for name in names:
+        p = output_dir / name
+        if p.exists() and p.is_file():
+            out[name] = str(p.relative_to(ROOT))
+
+    gerber_dir = output_dir / "gerber"
+    if gerber_dir.exists() and gerber_dir.is_dir():
+        out["gerber_dir"] = str(gerber_dir.relative_to(ROOT))
+        out["gerber_count"] = len([x for x in gerber_dir.iterdir() if x.is_file()])
+    return out
+
+
+def _detail_from_step(step: dict, fallback: str) -> str:
+    if not isinstance(step, dict):
+        return fallback
+    if step.get("error"):
+        return str(step["error"])
+    if step.get("stderr"):
+        return str(step["stderr"]).strip() or fallback
+    if step.get("stdout"):
+        return str(step["stdout"]).strip() or fallback
+    if step.get("output"):
+        return str(step["output"]).strip() or fallback
+    return fallback
+
+
+def cmd_route(args) -> int:
+    state = _load_state(args.example)
+    state["attempt_count"] = int(state.get("attempt_count", 0)) + 1
+
+    check_result, meta, board_hash, board_name = _run_checks(args.example, args.clearance_mm)
+    state["board_hash"] = board_hash
+    state["board_name"] = board_name
+
+    last_failure = state.get("last_failure")
+    if (not args.force and last_failure and last_failure.get("hash") == board_hash):
+        payload = {
+            "ok": False,
+            "action": "route",
+            "example": args.example,
+            "board_hash": board_hash,
+            "reused_failure": True,
+            "message": "Board degismemis. Ayni hatayi tekrarliyorum; route yeniden calistirilmadi.",
+            "failure": last_failure,
+            "stages": state.get("stages", {}),
+        }
+        return _json_out(payload, 2)
+
+    if not check_result["ok"]:
+        failure = {
+            "hash": board_hash,
+            "stage": "checks",
+            "summary": "placement/net kontrolu basarisiz",
+            "details": check_result["errors"],
+            "warnings": check_result["warnings"],
+        }
+        state["last_failure"] = failure
+        state["last_status"] = "failed"
+        _set_stage(state, "checks", "fail", check_result["errors"], check_result["warnings"])
+        _mark_downstream_pending(state, "checks")
+        _save_state(args.example, state)
+        payload = {
+            "ok": False,
+            "action": "route",
+            "example": args.example,
+            "board_hash": board_hash,
+            "failure": failure,
+            "stages": state["stages"],
+        }
+        return _json_out(payload, 1)
+
+    _set_stage(state, "checks", "pass", ["placement + nets kontrolu gecti"], check_result["warnings"])
+
+    output_dir = Path(args.output) if args.output else ROOT / "output" / args.example
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    circuit: Circuit = meta["circuit"]
+    placement = meta["placement"]
+    board_w, board_h = meta["board_size"]
+    result = full_pipeline(
+        circuit,
+        str(output_dir),
+        board_width=board_w,
+        board_height=board_h,
+        placement=placement,
+    )
+
+    steps = result.get("steps", {})
+    export_ok = bool(steps.get("export_unrouted", {}).get("ok")) and bool(steps.get("dsn_export", {}).get("ok"))
+    route_ok = (
+        bool(steps.get("freerouting", {}).get("ok"))
+        and bool(steps.get("parse_ses", {}).get("ok"))
+        and bool(steps.get("export_routed", {}).get("ok"))
+    )
+    drc_ok = bool(steps.get("drc", {}).get("ok"))
+
+    render_step = steps.get("render", {})
+    if isinstance(render_step, dict) and render_step:
+        render_ok = all(v.get("ok", False) for v in render_step.values() if isinstance(v, dict))
+    else:
+        render_ok = False
+    pack_ok = bool(steps.get("gerber", {}).get("ok")) and render_ok
+
+    _set_stage(state, "export", "pass" if export_ok else "fail", [
+        _detail_from_step(steps.get("dsn_export", {}), "dsn export sonucu belirsiz")
+    ])
+    _set_stage(state, "route", "pass" if route_ok else "fail", [
+        _detail_from_step(steps.get("freerouting", {}), "freerouting sonucu belirsiz")
+    ])
+    _set_stage(state, "drc", "pass" if drc_ok else "fail", [
+        _detail_from_step(steps.get("drc", {}), "drc sonucu belirsiz")
+    ])
+    _set_stage(state, "pack", "pass" if pack_ok else "fail", [
+        _detail_from_step(steps.get("gerber", {}), "gerber sonucu belirsiz")
+    ])
+
+    success = export_ok and route_ok and drc_ok
+    state["artifacts"] = _pipeline_artifacts(output_dir)
+
+    if success:
+        state["last_status"] = "success"
+        state["last_success"] = {
+            "hash": board_hash,
+            "timestamp": _utc_now(),
+        }
+        state["last_failure"] = None
+        _save_state(args.example, state)
+        payload = {
+            "ok": True,
+            "action": "route",
+            "example": args.example,
+            "board_hash": board_hash,
+            "checks": check_result,
+            "stages": state["stages"],
+            "artifacts": state["artifacts"],
+        }
+        return _json_out(payload, 0)
+
+    if not route_ok:
+        fail_stage = "route"
+        summary = "freerouting/asama route basarisiz; placement veya netleri duzeltip tekrar dene"
+        detail = _detail_from_step(steps.get("freerouting", {}), "freerouting cikti uretmedi")
+    elif not drc_ok:
+        fail_stage = "drc"
+        summary = "routing tamamlandi ama DRC basarisiz"
+        detail = _detail_from_step(steps.get("drc", {}), "drc detay yok")
+    else:
+        fail_stage = "export"
+        summary = "export asamasi basarisiz"
+        detail = _detail_from_step(steps.get("dsn_export", {}), "export detay yok")
+
+    failure = {
+        "hash": board_hash,
+        "stage": fail_stage,
+        "summary": summary,
+        "details": [detail],
+        "warnings": check_result["warnings"],
+    }
+    state["last_failure"] = failure
+    state["last_status"] = "failed"
+    _save_state(args.example, state)
+
+    payload = {
+        "ok": False,
+        "action": "route",
+        "example": args.example,
+        "board_hash": board_hash,
+        "checks": check_result,
+        "failure": failure,
+        "stages": state["stages"],
+        "artifacts": state["artifacts"],
+    }
+    return _json_out(payload, 1)
+
+
+def cmd_reset(args) -> int:
+    path = _state_path(args.example)
+    if path.exists():
+        path.unlink()
+    payload = {
+        "ok": True,
+        "action": "reset",
+        "example": args.example,
+        "state_path": str(path.relative_to(ROOT)),
+    }
+    return _json_out(payload, 0)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    examples = list_example_names()
+    p = argparse.ArgumentParser(
+        prog="autoboard",
+        description="Stage-aware board checker and router for LLM agents.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", help="Show persisted stage/status state.")
+    p_status.add_argument("--example", choices=examples, default="led")
+    p_status.set_defaults(func=cmd_status)
+
+    p_check = sub.add_parser("check", help="Run pre-route checks (placement + nets).")
+    p_check.add_argument("--example", choices=examples, default="led")
+    p_check.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
+    p_check.set_defaults(func=cmd_check)
+
+    p_route = sub.add_parser("route", help="Run checks and then full route pipeline.")
+    p_route.add_argument("--example", choices=examples, default="led")
+    p_route.add_argument("--output", default=None, help="Output directory (default: output/<example>)")
+    p_route.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
+    p_route.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash.")
+    p_route.set_defaults(func=cmd_route)
+
+    p_reset = sub.add_parser("reset", help="Delete stored state for an example.")
+    p_reset.add_argument("--example", choices=examples, default="led")
+    p_reset.set_defaults(func=cmd_reset)
+
+    return p
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
