@@ -11,8 +11,8 @@ The loop continues until the agent calls finish_layout successfully or max
 iterations is reached.
 
 HARD MODEL POLICY:
-- ONLY Gemini 3.1 Pro Preview is allowed.
-- NO other Gemini model may be used in this script.
+- ONLY Gemini models with major version >= 3 are allowed.
+- Gemini 2.x or below is strictly forbidden.
 """
 
 from __future__ import annotations
@@ -44,18 +44,19 @@ GRID_START_X = 120.0
 GRID_START_Y = 80.0
 GRID_COLS = 4
 DEFAULT_SNAP_MM = 0.5
-ALLOWED_GEMINI_MODEL = "gemini-3.1-pro-preview"
+MIN_GEMINI_MAJOR = 3
+DEFAULT_GEMINI_MODEL = "gemini-3-pro-preview"
 MODEL_POLICY_BANNER = (
-    "HARD POLICY: ONLY 'gemini-3.1-pro-preview' is allowed. "
-    "NO OTHER GEMINI MODEL MAY BE USED."
+    "HARD POLICY: ONLY GEMINI MODELS WITH MAJOR VERSION >= 3 ARE ALLOWED. "
+    "GEMINI 2.x OR BELOW IS FORBIDDEN."
 )
 
 
 SYSTEM_PROMPT = """You are the internal PCB layout agent for this repository.
 
 HARD POLICY:
-- You are running under Gemini 3.1 Pro Preview only.
-- Do not assume or reference any other Gemini model variant.
+- You are running under Gemini major version >= 3.
+- Gemini 2.x or below is forbidden in this workflow.
 
 You have exactly 3 tools:
 1) apply_placement_patch
@@ -121,6 +122,29 @@ def _read_key_file(path: Path) -> dict[str, str]:
         if parsed:
             out[key_name] = parsed
     return out
+
+
+def _normalize_model_name(model: str) -> str:
+    model = model.strip()
+    if model.startswith("models/"):
+        return model[len("models/") :]
+    return model
+
+
+def _gemini_major_version(model: str) -> int | None:
+    normalized = _normalize_model_name(model)
+    match = re.match(r"^gemini-(\d+)(?:\.[0-9]+)?(?:-|$)", normalized)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def _is_allowed_model(model: str) -> bool:
+    major = _gemini_major_version(model)
+    return major is not None and major >= MIN_GEMINI_MAJOR
 
 
 def _load_gemini_keys() -> list[str]:
@@ -311,13 +335,14 @@ def _snap(value: float, step: float) -> float:
 
 class LayoutLoop:
     def __init__(self, example: str, model: str, max_iters: int, clearance_mm: float, snap_mm: float):
-        if model != ALLOWED_GEMINI_MODEL:
+        requested_model = _normalize_model_name(model)
+        if not _is_allowed_model(requested_model):
             raise RuntimeError(
-                f"{MODEL_POLICY_BANNER} Requested='{model}'. "
-                f"Allowed='{ALLOWED_GEMINI_MODEL}'."
+                f"{MODEL_POLICY_BANNER} Requested='{requested_model}'. "
+                "Use a Gemini model with major version >= 3 (e.g. gemini-3-pro-preview or gemini-3.1-pro-preview)."
             )
         self.example = example
-        self.model = model
+        self.model = requested_model
         self.max_iters = max_iters
         self.clearance_mm = clearance_mm
         self.snap_mm = snap_mm
@@ -756,14 +781,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Experimental Gemini internal layout loop. "
-            "HARD-LOCKED to gemini-3.1-pro-preview only."
+            "HARD-LOCKED to Gemini major version >= 3 only."
         )
     )
     parser.add_argument("--example", default="led", help="Board example name (default: led)")
     parser.add_argument(
         "--model",
-        default=ALLOWED_GEMINI_MODEL,
-        help=f"Gemini model name (HARD-LOCKED to {ALLOWED_GEMINI_MODEL})",
+        default=DEFAULT_GEMINI_MODEL,
+        help="Gemini model name (must be major version >= 3)",
     )
     parser.add_argument("--max-iters", type=int, default=8, help="Maximum model iterations")
     parser.add_argument("--clearance-mm", type=float, default=0.2, help="Overlap clearance")

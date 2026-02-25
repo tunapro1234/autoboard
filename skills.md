@@ -5,9 +5,9 @@ Goal: let the LLM make design decisions, and let `abd` enforce deterministic che
 
 ## HARD MODEL POLICY (NON-NEGOTIABLE)
 
-1. ONLY `gemini-3.1-pro-preview` is allowed for the Gemini layout loop.
-2. NO other Gemini model may be used under any condition.
-3. If the model is not exactly `gemini-3.1-pro-preview`, stop and fix configuration first.
+1. ONLY Gemini models with major version `>= 3` are allowed for the layout loop.
+2. Gemini `2.x` and below are disallowed under any condition.
+3. If the model is not a Gemini 3+ variant (for example `gemini-3-pro-preview` or `gemini-3.1-pro-preview`), stop and fix configuration first.
 
 ## 1) Trigger (When to use)
 
