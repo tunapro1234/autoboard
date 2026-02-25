@@ -1,191 +1,137 @@
-# PCB Agent Skills / Handoff Contract
+# PCB Skill Notes (ABD + LLM Workflow)
 
-Bu dosya, **LLM'i dogrudan gommeden** (API key, model server, SDK yok) Claude Code veya Codex gibi agent'larin PCB tasarim surecini asama asama yurutup programa sinyal vermesi icin ortak sozlesmeyi tanimlar.
+Bu dosya, LLM ile PCB gelistirme surecinde **ABD toolunu** nasil kullanacagimizi ve sureci nasil yurutecegimizi tanimlar.
 
-## 1) Kapsam ve Sinirlar
+## 1) Kapsam
 
 - Bu repo bir LLM runtime degildir.
-- Agent sadece dosya degistirir, komut calistirir ve sinyal birakir.
-- Program tarafi sinyali okuyup ilgili tool adimini calistirir.
-- Uretim hedefi: `circuit -> simulate -> route -> gerber`.
+- Claude/Codex devreyi tasarlar, duzeltir, placement yapar.
+- `abd` deterministic kontrolleri ve stage hafizasini yonetir.
+- Hedef akis: `schema -> layout -> manufacturing`.
 
-## 2) Roller
+## 2) Sorumluluk Paylasimi
 
-- `Agent (Codex/Claude)`:
-  - Board/circuit dosyalarini uretir veya gunceller.
-  - Asama tamamlayinca bir sinyal olusturur.
-  - Gerekli output dosya yollarini sinyal payload'ina yazar.
-- `Orchestrator (bizim program)`:
-  - Sinyali validate eder.
-  - Uygun pipeline komutunu calistirir.
-  - Sonucu `ok/fail` olarak yeni sinyal ile geri yazar.
+LLM sorumlulugu:
 
-## 3) Tasima Katmani (No Direct LLM Integration)
+1. Board hedeflerini planlamak (guc, USB, IO, footprint kararlari).
+2. Komponentleri toplamak ve devreyi (schema/netlist) kurmak.
+3. Placement iyilestirmek ve routing/DRC hatalarini duzeltmek.
 
-Sinyal iletimi dosya tabanli:
+ABD sorumlulugu:
 
-- Klasor: `.signals/<run_id>/`
-- Her olay bir JSON dosyasi:
-  - `0001_requirements_done.json`
-  - `0002_circuit_done.json`
-  - `0003_simulate_done.json`
-- Yazim kurali: once `*.tmp`, sonra atomic rename.
+1. Stage-state hafizasi tutmak (`.autoboard/<example>.json`).
+2. Schema/layout checklerini deterministic calistirmak.
+3. Routing zincirini kosmak ve hangi stage'in fail oldugunu acik dondurmek.
+4. Board degismediyse ayni hatayi tekrar dondurmek (gereksiz rerun engeli).
 
-Bu yapi CI, local shell ve farkli agent ortamlarinda ayni calisir.
+## 3) Iki Ana Dongu
 
-## 4) Olay Semasi (JSON)
+### A) Schema Dongusu
 
-Tum olaylar su sekilde olmalidir:
+1. **Plan/Arastirma** (LLM only, ABD disi)
+2. **Schema Build**: komponent ve baglantilar dosyalara islenir
+3. **Schema Check**: net/pin/footprint tutarliligi kontrol edilir
 
-```json
-{
-  "run_id": "2026-02-25-esp32s3-001",
-  "seq": 3,
-  "stage": "simulate_done",
-  "status": "ok",
-  "producer": "codex",
-  "timestamp_utc": "2026-02-25T15:40:00Z",
-  "board": "esp32s3",
-  "outputs": {
-    "primary": "output/esp32s3/sim_report.json"
-  },
-  "meta": {
-    "notes": "3v3 rail 3.31V"
-  }
-}
-```
+Gate:
 
-Zorunlu alanlar:
+- `schema_build=pass` ve `schema_check=pass` olmadan layouta guvenilmez.
 
-- `run_id`, `seq`, `stage`, `status`, `producer`, `timestamp_utc`
-- `status`: `ok | fail`
+### B) Layout Dongusu
 
-Opsiyonel alanlar:
+1. **Layout Place**: placement, board siniri, cakisma kontrolu
+2. **Layout Export**: unrouted PCB + DSN
+3. **Layout Route**: freerouting + SES parse + routed PCB
+4. **Layout Check**: DRC
+5. **Layout Pack**: gerber/render
 
-- `board`, `outputs`, `meta`
+Retry:
 
-## 5) Asama Modeli
+- `layout_route` veya `layout_check` fail ise placement/netler duzeltilir.
+- `schema_check` fail ise schema dongusune geri donulur.
 
-Standart stage isimleri:
+## 4) ABD Stage Modeli
 
-1. `requirements_done`
-2. `circuit_done`
-3. `simulate_done`
-4. `pcb_export_done`
-5. `route_done`
-6. `checks_done`
-7. `gerber_done`
+Schema loop:
 
-Fail durumu icin ayni stage + `status: fail` kullanilir.
+1. `schema_build`
+2. `schema_check`
 
-## 6) Program Tarafi Eylem Haritasi
+Layout loop:
 
-Minimum ve mevcut repo ile uyumlu yurutum:
+1. `layout_place`
+2. `layout_export`
+3. `layout_route`
+4. `layout_check`
+5. `layout_pack`
 
-1. Agent `circuit_done` sinyali birakir (`board` alani dolu).
-2. Orchestrator CLI ile check + route surecini kontrol eder:
-   - `./abd route --example <board>`
-3. Orchestrator pipeline loglarindan asama sonuclarini cikarir ve
-   `.signals/<run_id>/` altina sirali `*_done.json` olaylarini yazar.
+Status degerleri:
 
-Not:
+- `pending`
+- `pass`
+- `fail`
 
-- `abd`, `autoboard` komutunun kisaltmasidir.
-- `route` komutu check asamasini otomatik calistirir.
+## 5) ABD Komutlari
 
-## 7) Agent Tool Set (Claude/Codex icin)
+Temel komutlar:
 
-Agent'e verilecek minimum tool yetkileri:
-
-- Dosya okuma/yazma: `rg`, `sed`, `cat`, patch/apply
-- Calistirma: `python pipeline.py --example <name>`
-- Test: `pytest -q`
-- (Opsiyonel) KiCad dogrulama:
-  - `kicad-cli sch erc <file.kicad_sch>`
-  - `kicad-cli pcb drc <file.kicad_pcb>`
-
-Agent, bu repo disinda model host etmez; sadece mevcut toollarla calisir.
-
-## 8) Basit Akis Ornegi
-
-1. Agent board dosyasini gunceller.
-2. Agent su olayi yazar:
-
-```json
-{
-  "run_id": "run-led-001",
-  "seq": 2,
-  "stage": "circuit_done",
-  "status": "ok",
-  "producer": "claude",
-  "timestamp_utc": "2026-02-25T16:00:00Z",
-  "board": "led"
-}
-```
-
-3. Program `./abd route --example led` calistirir.
-4. Program sonuc olaylarini yazar:
-   - `simulate_done`
-   - `pcb_export_done`
-   - `route_done`
-   - `checks_done`
-   - `gerber_done`
-
-## 9) Guardrail'ler
-
-- Stage sirasi bozulursa olay reddedilir (`seq` monotonic olmali).
-- `fail` olayi geldiyse sonraki stage otomatik baslamaz.
-- Her stage icin zaman asimi ve retry politikasi `meta` icinde tutulur.
-- Ayni `run_id + seq` ciftine ikinci kez izin verilmez.
-
-## 10) Neden Bu Model
-
-- LLM baglantisi yok: vendor lock ve runtime karmasasi azalir.
-- Claude Code ve Codex ayni protokolle calisir.
-- Pipeline logic bizde kalir; agent sadece uretim ve handoff yapar.
-- Sonradan webhook/queue eklense bile payload sozlesmesi degismez.
-
-## 11) ABD Tool Kullanimi
-
-`abd` ve `autoboard` ayni tooldur:
-
-- `./abd status --example led`
-- `./abd status --example led --pretty`
-- `./abd status --example led --short`
-- `./abd check --example led`
-- `./abd route --example led`
-- `./abd forward --example led`
-- `./abd pull-forward --example led`
-- `./abd rewind --example led`
-- `./abd reset --example led`
 - `./abd help`
+- `./abd status --example <name>`
+- `./abd status --example <name> --pretty`
+- `./abd status --example <name> --short`
+- `./abd check --example <name>`
+- `./abd route --example <name>`
+- `./abd forward --example <name>`
+- `./abd pull-forward --example <name>`
+- `./abd rewind --example <name>`
+- `./abd reset --example <name>`
 
-Komutlar:
+Notlar:
 
-1. `status`: schema/layout stage hafizasini gosterir (`.autoboard/<example>.json`).
-   - `--pretty`: insan okunur ozet
-   - `--short`: tek satir ozet
-2. `check`: `schema_check` + `layout_place` kontrollerini yapar.
-3. `route`: once `check`, sonra layout pipeline (`layout_export -> layout_route -> layout_check -> layout_pack`) calistirir.
-4. `forward` / `pull-forward`: route ile ayni akisi, stage ilerletme komutu olarak calistirir.
-5. `rewind`: state'i sifirlayip tum akisi bastan sona tekrar calistirir.
-6. `reset`: o board icin sadece stage hafizasini sifirlar.
-7. `help`: komut dokumantasyonunu verir (`./abd help route` gibi).
+- `route`: `check` + layout zinciri.
+- `forward`/`pull-forward`: route ile ayni akis (orchestrator dili icin alias).
+- `rewind`: state'i sifirlayip bastan sona yeniden kosar.
+- `reset`: sadece state temizler, route calistirmaz.
+- `--force`: ayni hash fail korumasini bypass eder.
 
-ABD stage isimleri:
+## 6) LLM Operasyon Playbook
 
-- Schema loop:
-  - `schema_build`
-  - `schema_check`
-- Layout loop:
-  - `layout_place`
-  - `layout_export`
-  - `layout_route`
-  - `layout_check`
-  - `layout_pack`
+LLM her iterasyonda su sirayi izlemeli:
 
-Onemli davranis:
+1. `./abd status --example <board> --short`
+2. Gerekirse `./abd check --example <board>`
+3. Check temizse `./abd forward --example <board>`
+4. Fail stage'e gore dosya duzeltmesi yap
+5. Tekrar `./abd forward --example <board>`
 
-- Son calismada hata varsa ve board degismediyse (`board_hash` ayni),
-  `route` ayni hatayi tekrar dondurur, yeniden deneme yapmaz.
-- LLM once dosyalari duzeltmeli, sonra `./abd route --example <board>` tekrar cagirmali.
+Fail yorumlama:
+
+- `schema_check` fail: net/pin/footprint map duzelt
+- `layout_place` fail: cakisma, board disi placement duzelt
+- `layout_route` fail: placement/topoloji/sinif kurallari iyilestir
+- `layout_check` fail: DRC kaynakli elektriksel/fiziksel ihlal duzelt
+- `layout_export` fail: footprint/export zinciri duzelt
+
+## 7) Ayni Hata Tekrari Engeli
+
+ABD, `board_hash` ile degisiklik tespit eder.
+
+- Son fail ile ayni hash gelirse rerun yapmaz.
+- `reused_failure: true` ile ayni hatayi geri verir.
+- LLM once dosyalari degistirmeli, sonra komutu tekrar calistirmali.
+
+Bu davranis, "degisiklik yoksa tekrar deneme" maliyetini engeller.
+
+## 8) Ornek Kisa Akis
+
+1. `./abd status --example led --short`
+2. `./abd check --example led`
+3. `./abd forward --example led`
+4. Fail varsa duzeltme
+5. `./abd forward --example led`
+6. Basariliysa artifactleri kontrol et (`output/<board>/`)
+
+## 9) Arac Secim Kurali
+
+- Normalde `pipeline.py` dogrudan cagrilmaz.
+- LLM yonetiminde standart arac `abd` olmalidir.
+- `pipeline.py` sadece debug/altyapi testi icin dogrudan kullanilir.
