@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage-aware CLI orchestrator for board checks and routing retries."""
+"""Schema/Layout stage-aware CLI orchestrator for board checks and routing retries."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import os
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -22,6 +21,10 @@ GRID_START_X = 120.0
 GRID_START_Y = 80.0
 GRID_COLS = 4
 
+SCHEMA_STAGES = ["schema_build", "schema_check"]
+LAYOUT_STAGES = ["layout_place", "layout_export", "layout_route", "layout_check", "layout_pack"]
+STAGE_ORDER = SCHEMA_STAGES + LAYOUT_STAGES
+
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
@@ -31,33 +34,106 @@ def _state_path(example: str) -> Path:
     return STATE_DIR / f"{example}.json"
 
 
+def _safe_rel(path: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        return str(path)
+
+
+def _empty_stage_entry() -> dict:
+    return {"status": "pending", "details": [], "warnings": []}
+
+
+def _new_stage_map() -> dict:
+    return {name: _empty_stage_entry() for name in STAGE_ORDER}
+
+
 def _default_state(example: str) -> dict:
     return {
         "example": example,
         "updated_at": _utc_now(),
         "last_status": "idle",
         "board_hash": None,
+        "board_name": example,
         "attempt_count": 0,
         "last_failure": None,
         "last_success": None,
-        "stages": {
-            "checks": {"status": "pending", "details": [], "warnings": []},
-            "export": {"status": "pending", "details": []},
-            "route": {"status": "pending", "details": []},
-            "drc": {"status": "pending", "details": []},
-            "pack": {"status": "pending", "details": []},
-        },
+        "stages": _new_stage_map(),
         "artifacts": {},
     }
+
+
+def _normalize_stage_entry(raw: dict | None) -> dict:
+    entry = _empty_stage_entry()
+    if not isinstance(raw, dict):
+        return entry
+
+    status = raw.get("status")
+    if isinstance(status, str):
+        entry["status"] = status
+
+    details = raw.get("details")
+    if isinstance(details, list):
+        entry["details"] = [str(x) for x in details]
+    elif details:
+        entry["details"] = [str(details)]
+
+    warnings = raw.get("warnings")
+    if isinstance(warnings, list):
+        entry["warnings"] = [str(x) for x in warnings]
+    elif warnings:
+        entry["warnings"] = [str(warnings)]
+
+    if isinstance(raw.get("updated_at"), str):
+        entry["updated_at"] = raw["updated_at"]
+
+    return entry
+
+
+def _normalize_state(example: str, raw: dict) -> dict:
+    state = _default_state(example)
+    if not isinstance(raw, dict):
+        return state
+
+    for key in ["updated_at", "last_status", "board_hash", "board_name", "attempt_count", "last_failure", "last_success"]:
+        if key in raw:
+            state[key] = raw[key]
+
+    if isinstance(raw.get("artifacts"), dict):
+        state["artifacts"] = raw["artifacts"]
+
+    raw_stages = raw.get("stages") if isinstance(raw.get("stages"), dict) else {}
+    has_new_keys = any(k in raw_stages for k in STAGE_ORDER)
+
+    if has_new_keys:
+        for stage in STAGE_ORDER:
+            state["stages"][stage] = _normalize_stage_entry(raw_stages.get(stage))
+    else:
+        checks = _normalize_stage_entry(raw_stages.get("checks"))
+        state["stages"]["schema_build"] = _empty_stage_entry()
+        if state.get("board_hash"):
+            state["stages"]["schema_build"]["status"] = "pass"
+            state["stages"]["schema_build"]["details"] = ["board tanimi yuklendi"]
+
+        state["stages"]["schema_check"] = _normalize_stage_entry(raw_stages.get("checks"))
+        state["stages"]["layout_place"] = checks
+        state["stages"]["layout_export"] = _normalize_stage_entry(raw_stages.get("export"))
+        state["stages"]["layout_route"] = _normalize_stage_entry(raw_stages.get("route"))
+        state["stages"]["layout_check"] = _normalize_stage_entry(raw_stages.get("drc"))
+        state["stages"]["layout_pack"] = _normalize_stage_entry(raw_stages.get("pack"))
+
+    return state
 
 
 def _load_state(example: str) -> dict:
     path = _state_path(example)
     if not path.exists():
         return _default_state(example)
+
     with path.open() as f:
-        data = json.load(f)
-    return data
+        raw = json.load(f)
+    return _normalize_state(example, raw)
 
 
 def _save_state(example: str, state: dict):
@@ -73,6 +149,74 @@ def _save_state(example: str, state: dict):
 def _json_out(payload: dict, exit_code: int):
     print(json.dumps(payload, indent=2, sort_keys=True))
     return exit_code
+
+
+def _rollup(statuses: list[str]) -> str:
+    if any(s == "fail" for s in statuses):
+        return "fail"
+    if statuses and all(s == "pass" for s in statuses):
+        return "pass"
+    if any(s == "pass" for s in statuses):
+        return "partial"
+    return "pending"
+
+
+def _loop_summary(state: dict) -> dict:
+    stages = state.get("stages", {})
+    schema_statuses = [stages.get(stage, {}).get("status", "pending") for stage in SCHEMA_STAGES]
+    layout_statuses = [stages.get(stage, {}).get("status", "pending") for stage in LAYOUT_STAGES]
+    return {
+        "schema": {
+            "status": _rollup(schema_statuses),
+            "stages": {stage: stages.get(stage, _empty_stage_entry()) for stage in SCHEMA_STAGES},
+        },
+        "layout": {
+            "status": _rollup(layout_statuses),
+            "stages": {stage: stages.get(stage, _empty_stage_entry()) for stage in LAYOUT_STAGES},
+        },
+    }
+
+
+def _status_short_line(example: str, state: dict, loops: dict) -> str:
+    return (
+        f"{example} "
+        f"schema={loops['schema']['status']} "
+        f"layout={loops['layout']['status']} "
+        f"last={state.get('last_status', 'idle')} "
+        f"hash={(state.get('board_hash') or '-')[:12]}"
+    )
+
+
+def _status_pretty_text(example: str, state: dict, loops: dict) -> str:
+    lines = []
+    lines.append(f"Example: {example}")
+    lines.append(f"Last Status: {state.get('last_status', 'idle')}")
+    lines.append(f"Board Hash: {state.get('board_hash') or '-'}")
+    lines.append(f"Attempts: {state.get('attempt_count', 0)}")
+    lines.append(f"Schema Loop: {loops['schema']['status']}")
+    lines.append(f"Layout Loop: {loops['layout']['status']}")
+    lines.append("")
+    lines.append("Schema Stages:")
+    for stage in SCHEMA_STAGES:
+        ent = state["stages"].get(stage, {})
+        detail = ent.get("details", [])
+        detail_text = detail[0] if detail else "-"
+        lines.append(f"  - {stage:13s} {ent.get('status', 'pending'):7s} {detail_text}")
+    lines.append("")
+    lines.append("Layout Stages:")
+    for stage in LAYOUT_STAGES:
+        ent = state["stages"].get(stage, {})
+        detail = ent.get("details", [])
+        detail_text = detail[0] if detail else "-"
+        lines.append(f"  - {stage:13s} {ent.get('status', 'pending'):7s} {detail_text}")
+
+    last_failure = state.get("last_failure")
+    if last_failure:
+        lines.append("")
+        lines.append("Last Failure:")
+        lines.append(f"  - stage: {last_failure.get('stage')}")
+        lines.append(f"  - summary: {last_failure.get('summary')}")
+    return "\n".join(lines)
 
 
 def _footprint_kind(comp) -> str:
@@ -210,11 +354,13 @@ def _validate_placement(circuit: Circuit,
     for ref, comp in circuit.components.items():
         if comp.simulation_only:
             continue
+
         fp_kind = _footprint_kind(comp)
         fp_def = FOOTPRINTS.get(fp_kind)
         if fp_def is None:
             errors.append(f"{ref}: footprint bulunamadi ({fp_kind})")
             continue
+
         if ref not in positions:
             errors.append(f"{ref}: placement yok")
             continue
@@ -244,8 +390,7 @@ def _validate_placement(circuit: Circuit,
         )
         if missing_custom:
             warnings.append(
-                "placement map eksik komponentler grid'e dustu: "
-                + ", ".join(missing_custom)
+                "placement map eksik komponentler grid'e dustu: " + ", ".join(missing_custom)
             )
 
     return errors, warnings
@@ -284,55 +429,108 @@ def _run_checks(example: str, clearance_mm: float) -> tuple[dict, dict, str, str
     board_hash = _build_fingerprint(circuit, spec.board_size, placement)
 
     net_errors, net_warnings = _validate_nets(circuit)
-    placement_errors, placement_warnings = _validate_placement(
-        circuit, placement, spec.board_size, clearance_mm
-    )
+    placement_errors, placement_warnings = _validate_placement(circuit, placement, spec.board_size, clearance_mm)
 
-    details = []
-    details.extend(net_errors)
-    details.extend(placement_errors)
-    warnings = []
-    warnings.extend(net_warnings)
-    warnings.extend(placement_warnings)
+    schema_ok = len(net_errors) == 0
+    layout_place_ok = len(placement_errors) == 0
 
-    checks_ok = len(details) == 0
     check_result = {
-        "ok": checks_ok,
-        "errors": details,
-        "warnings": warnings,
+        "ok": schema_ok and layout_place_ok,
+        "schema": {
+            "ok": schema_ok,
+            "errors": net_errors,
+            "warnings": net_warnings,
+        },
+        "layout_place": {
+            "ok": layout_place_ok,
+            "errors": placement_errors,
+            "warnings": placement_warnings,
+        },
+        "errors": [*net_errors, *placement_errors],
+        "warnings": [*net_warnings, *placement_warnings],
         "net_error_count": len(net_errors),
         "placement_error_count": len(placement_errors),
     }
-    return check_result, {"circuit": circuit, "placement": placement, "board_size": spec.board_size}, board_hash, str(spec.name)
+    meta = {"circuit": circuit, "placement": placement, "board_size": spec.board_size}
+    return check_result, meta, board_hash, str(spec.name)
 
 
-def _set_stage(state: dict, stage: str, status: str, details: list[str] | None = None, warnings: list[str] | None = None):
-    entry = state["stages"].setdefault(stage, {})
+def _set_stage(state: dict, stage: str, status: str,
+               details: list[str] | None = None,
+               warnings: list[str] | None = None):
+    entry = state["stages"].setdefault(stage, _empty_stage_entry())
     entry["status"] = status
     entry["updated_at"] = _utc_now()
     if details is not None:
-        entry["details"] = details
+        entry["details"] = [str(x) for x in details]
     if warnings is not None:
-        entry["warnings"] = warnings
+        entry["warnings"] = [str(x) for x in warnings]
 
 
 def _mark_downstream_pending(state: dict, start_stage: str):
-    order = ["checks", "export", "route", "drc", "pack"]
     seen = False
-    for stage in order:
+    for stage in STAGE_ORDER:
         if stage == start_stage:
             seen = True
             continue
         if seen:
-            _set_stage(state, stage, "pending", [])
+            _set_stage(state, stage, "pending", [], [])
+
+
+def _apply_check_stages(state: dict, check_result: dict):
+    _set_stage(state, "schema_build", "pass", ["board tanimi yuklendi"], [])
+    _set_stage(
+        state,
+        "schema_check",
+        "pass" if check_result["schema"]["ok"] else "fail",
+        check_result["schema"]["errors"] or ["schema net kontrolu gecti"],
+        check_result["schema"]["warnings"],
+    )
+    _set_stage(
+        state,
+        "layout_place",
+        "pass" if check_result["layout_place"]["ok"] else "fail",
+        check_result["layout_place"]["errors"] or ["placement kontrolu gecti"],
+        check_result["layout_place"]["warnings"],
+    )
+
+
+def _check_failure_payload(board_hash: str, check_result: dict) -> dict:
+    if not check_result["schema"]["ok"]:
+        return {
+            "hash": board_hash,
+            "stage": "schema_check",
+            "summary": "schema kontrolu basarisiz; netlist/pin baglantilarini duzelt",
+            "details": check_result["schema"]["errors"],
+            "warnings": check_result["schema"]["warnings"],
+        }
+
+    return {
+        "hash": board_hash,
+        "stage": "layout_place",
+        "summary": "placement kontrolu basarisiz; cakisma/sinir ihlallerini duzelt",
+        "details": check_result["layout_place"]["errors"],
+        "warnings": check_result["layout_place"]["warnings"],
+    }
 
 
 def cmd_status(args) -> int:
     state = _load_state(args.example)
+    loops = _loop_summary(state)
+
+    if args.short:
+        print(_status_short_line(args.example, state, loops))
+        return 0
+
+    if args.pretty:
+        print(_status_pretty_text(args.example, state, loops))
+        return 0
+
     payload = {
         "ok": True,
         "action": "status",
         "example": args.example,
+        "loops": loops,
         "state": state,
     }
     return _json_out(payload, 0)
@@ -342,13 +540,13 @@ def cmd_check(args) -> int:
     state = _load_state(args.example)
     state["attempt_count"] = int(state.get("attempt_count", 0)) + 1
 
-    check_result, meta, board_hash, board_name = _run_checks(args.example, args.clearance_mm)
+    check_result, _meta, board_hash, board_name = _run_checks(args.example, args.clearance_mm)
     state["board_hash"] = board_hash
     state["board_name"] = board_name
+    _apply_check_stages(state, check_result)
 
     if check_result["ok"]:
-        _set_stage(state, "checks", "pass", ["placement + nets kontrolu gecti"], check_result["warnings"])
-        _mark_downstream_pending(state, "checks")
+        _mark_downstream_pending(state, "layout_place")
         state["last_status"] = "checks_passed"
         _save_state(args.example, state)
         payload = {
@@ -358,20 +556,17 @@ def cmd_check(args) -> int:
             "board_hash": board_hash,
             "checks": check_result,
             "stages": state["stages"],
+            "loops": _loop_summary(state),
         }
         return _json_out(payload, 0)
 
-    failure = {
-        "hash": board_hash,
-        "stage": "checks",
-        "summary": "placement/net kontrolu basarisiz",
-        "details": check_result["errors"],
-        "warnings": check_result["warnings"],
-    }
+    failure = _check_failure_payload(board_hash, check_result)
     state["last_failure"] = failure
     state["last_status"] = "failed"
-    _set_stage(state, "checks", "fail", check_result["errors"], check_result["warnings"])
-    _mark_downstream_pending(state, "checks")
+    if failure["stage"] == "schema_check":
+        _mark_downstream_pending(state, "schema_check")
+    else:
+        _mark_downstream_pending(state, "layout_place")
     _save_state(args.example, state)
 
     payload = {
@@ -382,6 +577,7 @@ def cmd_check(args) -> int:
         "checks": check_result,
         "failure": failure,
         "stages": state["stages"],
+        "loops": _loop_summary(state),
     }
     return _json_out(payload, 1)
 
@@ -401,12 +597,13 @@ def _pipeline_artifacts(output_dir: Path) -> dict:
     for name in names:
         p = output_dir / name
         if p.exists() and p.is_file():
-            out[name] = str(p.relative_to(ROOT))
+            out[name] = _safe_rel(p)
 
     gerber_dir = output_dir / "gerber"
     if gerber_dir.exists() and gerber_dir.is_dir():
-        out["gerber_dir"] = str(gerber_dir.relative_to(ROOT))
+        out["gerber_dir"] = _safe_rel(gerber_dir)
         out["gerber_count"] = len([x for x in gerber_dir.iterdir() if x.is_file()])
+
     return out
 
 
@@ -424,52 +621,53 @@ def _detail_from_step(step: dict, fallback: str) -> str:
     return fallback
 
 
-def cmd_route(args) -> int:
+def _run_route_action(args, action_name: str) -> int:
     state = _load_state(args.example)
     state["attempt_count"] = int(state.get("attempt_count", 0)) + 1
 
     check_result, meta, board_hash, board_name = _run_checks(args.example, args.clearance_mm)
     state["board_hash"] = board_hash
     state["board_name"] = board_name
+    _apply_check_stages(state, check_result)
 
     last_failure = state.get("last_failure")
-    if (not args.force and last_failure and last_failure.get("hash") == board_hash):
+    if not args.force and last_failure and last_failure.get("hash") == board_hash:
+        _save_state(args.example, state)
         payload = {
             "ok": False,
-            "action": "route",
+            "action": action_name,
             "example": args.example,
             "board_hash": board_hash,
             "reused_failure": True,
             "message": "Board degismemis. Ayni hatayi tekrarliyorum; route yeniden calistirilmadi.",
             "failure": last_failure,
             "stages": state.get("stages", {}),
+            "loops": _loop_summary(state),
         }
         return _json_out(payload, 2)
 
     if not check_result["ok"]:
-        failure = {
-            "hash": board_hash,
-            "stage": "checks",
-            "summary": "placement/net kontrolu basarisiz",
-            "details": check_result["errors"],
-            "warnings": check_result["warnings"],
-        }
+        failure = _check_failure_payload(board_hash, check_result)
         state["last_failure"] = failure
         state["last_status"] = "failed"
-        _set_stage(state, "checks", "fail", check_result["errors"], check_result["warnings"])
-        _mark_downstream_pending(state, "checks")
+        if failure["stage"] == "schema_check":
+            _mark_downstream_pending(state, "schema_check")
+        else:
+            _mark_downstream_pending(state, "layout_place")
         _save_state(args.example, state)
+
         payload = {
             "ok": False,
-            "action": "route",
+            "action": action_name,
             "example": args.example,
             "board_hash": board_hash,
             "failure": failure,
             "stages": state["stages"],
+            "loops": _loop_summary(state),
         }
         return _json_out(payload, 1)
 
-    _set_stage(state, "checks", "pass", ["placement + nets kontrolu gecti"], check_result["warnings"])
+    _mark_downstream_pending(state, "layout_place")
 
     output_dir = Path(args.output) if args.output else ROOT / "output" / args.example
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -495,58 +693,78 @@ def cmd_route(args) -> int:
     drc_ok = bool(steps.get("drc", {}).get("ok"))
 
     render_step = steps.get("render", {})
-    if isinstance(render_step, dict) and render_step:
-        render_ok = all(v.get("ok", False) for v in render_step.values() if isinstance(v, dict))
-    else:
-        render_ok = False
-    pack_ok = bool(steps.get("gerber", {}).get("ok")) and render_ok
+    render_ok = isinstance(render_step, dict) and render_step and all(
+        v.get("ok", False) for v in render_step.values() if isinstance(v, dict)
+    )
+    pack_ok = bool(steps.get("gerber", {}).get("ok")) and bool(render_ok)
 
-    _set_stage(state, "export", "pass" if export_ok else "fail", [
-        _detail_from_step(steps.get("dsn_export", {}), "dsn export sonucu belirsiz")
-    ])
-    _set_stage(state, "route", "pass" if route_ok else "fail", [
-        _detail_from_step(steps.get("freerouting", {}), "freerouting sonucu belirsiz")
-    ])
-    _set_stage(state, "drc", "pass" if drc_ok else "fail", [
-        _detail_from_step(steps.get("drc", {}), "drc sonucu belirsiz")
-    ])
-    _set_stage(state, "pack", "pass" if pack_ok else "fail", [
-        _detail_from_step(steps.get("gerber", {}), "gerber sonucu belirsiz")
-    ])
+    _set_stage(
+        state,
+        "layout_export",
+        "pass" if export_ok else "fail",
+        [
+            _detail_from_step(steps.get("export_unrouted", {}), "unrouted export sonucu belirsiz"),
+            _detail_from_step(steps.get("dsn_export", {}), "dsn export sonucu belirsiz"),
+        ],
+        [],
+    )
+    _set_stage(
+        state,
+        "layout_route",
+        "pass" if route_ok else "fail",
+        [
+            _detail_from_step(steps.get("freerouting", {}), "freerouting sonucu belirsiz"),
+            _detail_from_step(steps.get("parse_ses", {}), "ses parse sonucu belirsiz"),
+        ],
+        [],
+    )
+    _set_stage(
+        state,
+        "layout_check",
+        "pass" if drc_ok else "fail",
+        [_detail_from_step(steps.get("drc", {}), "drc sonucu belirsiz")],
+        [],
+    )
+    _set_stage(
+        state,
+        "layout_pack",
+        "pass" if pack_ok else "fail",
+        [_detail_from_step(steps.get("gerber", {}), "gerber sonucu belirsiz")],
+        [],
+    )
 
     success = export_ok and route_ok and drc_ok
     state["artifacts"] = _pipeline_artifacts(output_dir)
 
     if success:
         state["last_status"] = "success"
-        state["last_success"] = {
-            "hash": board_hash,
-            "timestamp": _utc_now(),
-        }
+        state["last_success"] = {"hash": board_hash, "timestamp": _utc_now()}
         state["last_failure"] = None
         _save_state(args.example, state)
+
         payload = {
             "ok": True,
-            "action": "route",
+            "action": action_name,
             "example": args.example,
             "board_hash": board_hash,
             "checks": check_result,
             "stages": state["stages"],
+            "loops": _loop_summary(state),
             "artifacts": state["artifacts"],
         }
         return _json_out(payload, 0)
 
     if not route_ok:
-        fail_stage = "route"
-        summary = "freerouting/asama route basarisiz; placement veya netleri duzeltip tekrar dene"
+        fail_stage = "layout_route"
+        summary = "freerouting/layout route basarisiz; placement veya netleri duzelt"
         detail = _detail_from_step(steps.get("freerouting", {}), "freerouting cikti uretmedi")
     elif not drc_ok:
-        fail_stage = "drc"
-        summary = "routing tamamlandi ama DRC basarisiz"
+        fail_stage = "layout_check"
+        summary = "routing tamamlandi ama layout check (DRC) basarisiz"
         detail = _detail_from_step(steps.get("drc", {}), "drc detay yok")
     else:
-        fail_stage = "export"
-        summary = "export asamasi basarisiz"
+        fail_stage = "layout_export"
+        summary = "layout export asamasi basarisiz"
         detail = _detail_from_step(steps.get("dsn_export", {}), "export detay yok")
 
     failure = {
@@ -562,15 +780,33 @@ def cmd_route(args) -> int:
 
     payload = {
         "ok": False,
-        "action": "route",
+        "action": action_name,
         "example": args.example,
         "board_hash": board_hash,
         "checks": check_result,
         "failure": failure,
         "stages": state["stages"],
+        "loops": _loop_summary(state),
         "artifacts": state["artifacts"],
     }
     return _json_out(payload, 1)
+
+
+def cmd_route(args) -> int:
+    return _run_route_action(args, "route")
+
+
+def cmd_forward(args) -> int:
+    return _run_route_action(args, "forward")
+
+
+def cmd_rewind(args) -> int:
+    state_path = _state_path(args.example)
+    if state_path.exists():
+        state_path.unlink()
+
+    result_code = _run_route_action(args, "rewind")
+    return result_code if result_code != 0 else 0
 
 
 def cmd_reset(args) -> int:
@@ -581,40 +817,122 @@ def cmd_reset(args) -> int:
         "ok": True,
         "action": "reset",
         "example": args.example,
-        "state_path": str(path.relative_to(ROOT)),
+        "state_path": _safe_rel(path),
     }
     return _json_out(payload, 0)
 
 
+def cmd_help(args) -> int:
+    topic = args.topic
+    if topic == "status":
+        print("abd status kullanim:")
+        print("  ./abd status --example led")
+        print("  ./abd status --example led --pretty")
+        print("  ./abd status --example led --short")
+        return 0
+    if topic == "check":
+        print("abd check kullanim:")
+        print("  ./abd check --example led")
+        print("  schema_check + layout_place kontrollerini yapar.")
+        return 0
+    if topic == "route":
+        print("abd route kullanim:")
+        print("  ./abd route --example led")
+        print("  check + layout_export/layout_route/layout_check/layout_pack.")
+        return 0
+    if topic in {"forward", "pull-forward"}:
+        print("abd forward/pull-forward kullanim:")
+        print("  ./abd forward --example led")
+        print("  ./abd pull-forward --example led")
+        print("  route ile ayni akis, stage akisini ilerletmek icin kullanilir.")
+        return 0
+    if topic == "rewind":
+        print("abd rewind kullanim:")
+        print("  ./abd rewind --example led")
+        print("  state'i sifirlayip tum akisi bastan calistirir.")
+        return 0
+    if topic == "reset":
+        print("abd reset kullanim:")
+        print("  ./abd reset --example led")
+        print("  sadece state dosyasini temizler, route calistirmaz.")
+        return 0
+
+    print("ABD Tool Help")
+    print("")
+    print("Komutlar:")
+    print("  ./abd status [--example <name>] [--pretty|--short]")
+    print("  ./abd check [--example <name>] [--clearance-mm <v>]")
+    print("  ./abd route [--example <name>] [--output <dir>] [--force]")
+    print("  ./abd forward [--example <name>] [--output <dir>] [--force]")
+    print("  ./abd pull-forward [--example <name>] [--output <dir>] [--force]")
+    print("  ./abd rewind [--example <name>] [--output <dir>] [--force]")
+    print("  ./abd reset [--example <name>]")
+    print("  ./abd help [status|check|route|forward|rewind|reset]")
+    print("")
+    print("Loop Modeli:")
+    print("  schema_build -> schema_check")
+    print("  layout_place -> layout_export -> layout_route -> layout_check -> layout_pack")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     examples = list_example_names()
-    p = argparse.ArgumentParser(
+    parser = argparse.ArgumentParser(
         prog="autoboard",
-        description="Stage-aware board checker and router for LLM agents.",
+        description="Schema/Layout stage-aware board checker and router for LLM agents.",
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_status = sub.add_parser("status", help="Show persisted stage/status state.")
+    p_status = sub.add_parser("status", help="Show persisted schema/layout state.")
     p_status.add_argument("--example", choices=examples, default="led")
+    p_status.add_argument("--pretty", action="store_true", help="Human-readable status output")
+    p_status.add_argument("--short", action="store_true", help="Single-line summary output")
     p_status.set_defaults(func=cmd_status)
 
-    p_check = sub.add_parser("check", help="Run pre-route checks (placement + nets).")
+    p_check = sub.add_parser("check", help="Run schema + layout placement checks.")
     p_check.add_argument("--example", choices=examples, default="led")
     p_check.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
     p_check.set_defaults(func=cmd_check)
 
-    p_route = sub.add_parser("route", help="Run checks and then full route pipeline.")
+    p_route = sub.add_parser("route", help="Run checks and then full layout route pipeline.")
     p_route.add_argument("--example", choices=examples, default="led")
     p_route.add_argument("--output", default=None, help="Output directory (default: output/<example>)")
     p_route.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
-    p_route.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash.")
+    p_route.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash")
     p_route.set_defaults(func=cmd_route)
 
-    p_reset = sub.add_parser("reset", help="Delete stored state for an example.")
+    p_forward = sub.add_parser("forward", help="Advance from checks to end (same as route flow).")
+    p_forward.add_argument("--example", choices=examples, default="led")
+    p_forward.add_argument("--output", default=None, help="Output directory (default: output/<example>)")
+    p_forward.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
+    p_forward.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash")
+    p_forward.set_defaults(func=cmd_forward)
+
+    p_pull_forward = sub.add_parser("pull-forward", help="Alias of forward.")
+    p_pull_forward.add_argument("--example", choices=examples, default="led")
+    p_pull_forward.add_argument("--output", default=None, help="Output directory (default: output/<example>)")
+    p_pull_forward.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
+    p_pull_forward.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash")
+    p_pull_forward.set_defaults(func=cmd_forward)
+
+    p_rewind = sub.add_parser("rewind", help="Reset state and run the full flow from scratch.")
+    p_rewind.add_argument("--example", choices=examples, default="led")
+    p_rewind.add_argument("--output", default=None, help="Output directory (default: output/<example>)")
+    p_rewind.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_MM)
+    p_rewind.add_argument("--force", action="store_true", help="Force rerun even with same failed board hash")
+    p_rewind.set_defaults(func=cmd_rewind)
+
+    p_reset = sub.add_parser("reset", help="Delete stored state for an example")
     p_reset.add_argument("--example", choices=examples, default="led")
     p_reset.set_defaults(func=cmd_reset)
 
-    return p
+    p_help = sub.add_parser("help", help="Show command help and quick recipes.")
+    p_help.add_argument("topic", nargs="?", choices=[
+        "status", "check", "route", "forward", "pull-forward", "rewind", "reset"
+    ])
+    p_help.set_defaults(func=cmd_help)
+
+    return parser
 
 
 def main() -> int:

@@ -83,15 +83,15 @@ Fail durumu icin ayni stage + `status: fail` kullanilir.
 Minimum ve mevcut repo ile uyumlu yurutum:
 
 1. Agent `circuit_done` sinyali birakir (`board` alani dolu).
-2. Orchestrator tek komutla tum zinciri calistirir:
-   - `python pipeline.py --example <board> --output output/<board>`
+2. Orchestrator CLI ile check + route surecini kontrol eder:
+   - `./abd route --example <board>`
 3. Orchestrator pipeline loglarindan asama sonuclarini cikarir ve
    `.signals/<run_id>/` altina sirali `*_done.json` olaylarini yazar.
 
 Not:
 
-- Simdilik stage-stage ayri CLI yok; mevcut guvenli yol full pipeline komutudur.
-- Daha sonra ihtiyac olursa asama-bazli komutlar ayrilabilir.
+- `abd`, `autoboard` komutunun kisaltmasidir.
+- `route` komutu check asamasini otomatik calistirir.
 
 ## 7) Agent Tool Set (Claude/Codex icin)
 
@@ -123,7 +123,7 @@ Agent, bu repo disinda model host etmez; sadece mevcut toollarla calisir.
 }
 ```
 
-3. Program `python pipeline.py --example led --output output/led` calistirir.
+3. Program `./abd route --example led` calistirir.
 4. Program sonuc olaylarini yazar:
    - `simulate_done`
    - `pcb_export_done`
@@ -144,3 +144,48 @@ Agent, bu repo disinda model host etmez; sadece mevcut toollarla calisir.
 - Claude Code ve Codex ayni protokolle calisir.
 - Pipeline logic bizde kalir; agent sadece uretim ve handoff yapar.
 - Sonradan webhook/queue eklense bile payload sozlesmesi degismez.
+
+## 11) ABD Tool Kullanimi
+
+`abd` ve `autoboard` ayni tooldur:
+
+- `./abd status --example led`
+- `./abd status --example led --pretty`
+- `./abd status --example led --short`
+- `./abd check --example led`
+- `./abd route --example led`
+- `./abd forward --example led`
+- `./abd pull-forward --example led`
+- `./abd rewind --example led`
+- `./abd reset --example led`
+- `./abd help`
+
+Komutlar:
+
+1. `status`: schema/layout stage hafizasini gosterir (`.autoboard/<example>.json`).
+   - `--pretty`: insan okunur ozet
+   - `--short`: tek satir ozet
+2. `check`: `schema_check` + `layout_place` kontrollerini yapar.
+3. `route`: once `check`, sonra layout pipeline (`layout_export -> layout_route -> layout_check -> layout_pack`) calistirir.
+4. `forward` / `pull-forward`: route ile ayni akisi, stage ilerletme komutu olarak calistirir.
+5. `rewind`: state'i sifirlayip tum akisi bastan sona tekrar calistirir.
+6. `reset`: o board icin sadece stage hafizasini sifirlar.
+7. `help`: komut dokumantasyonunu verir (`./abd help route` gibi).
+
+ABD stage isimleri:
+
+- Schema loop:
+  - `schema_build`
+  - `schema_check`
+- Layout loop:
+  - `layout_place`
+  - `layout_export`
+  - `layout_route`
+  - `layout_check`
+  - `layout_pack`
+
+Onemli davranis:
+
+- Son calismada hata varsa ve board degismediyse (`board_hash` ayni),
+  `route` ayni hatayi tekrar dondurur, yeniden deneme yapmaz.
+- LLM once dosyalari duzeltmeli, sonra `./abd route --example <board>` tekrar cagirmali.
