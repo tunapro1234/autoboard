@@ -3,6 +3,12 @@
 This skill defines how an LLM should run PCB work through `abd` using two loops: schema and layout.
 Goal: let the LLM make design decisions, and let `abd` enforce deterministic checks and stage control.
 
+## HARD MODEL POLICY (NON-NEGOTIABLE)
+
+1. ONLY `gemini-3.1-pro-preview` is allowed for the Gemini layout loop.
+2. NO other Gemini model may be used under any condition.
+3. If the model is not exactly `gemini-3.1-pro-preview`, stop and fix configuration first.
+
 ## 1) Trigger (When to use)
 
 Use this skill when:

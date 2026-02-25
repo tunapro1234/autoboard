@@ -9,6 +9,10 @@ It runs an internal tool loop with Gemini:
 
 The loop continues until the agent calls finish_layout successfully or max
 iterations is reached.
+
+HARD MODEL POLICY:
+- ONLY Gemini 3.1 Pro Preview is allowed.
+- NO other Gemini model may be used in this script.
 """
 
 from __future__ import annotations
@@ -40,9 +44,18 @@ GRID_START_X = 120.0
 GRID_START_Y = 80.0
 GRID_COLS = 4
 DEFAULT_SNAP_MM = 0.5
+ALLOWED_GEMINI_MODEL = "gemini-3.1-pro-preview"
+MODEL_POLICY_BANNER = (
+    "HARD POLICY: ONLY 'gemini-3.1-pro-preview' is allowed. "
+    "NO OTHER GEMINI MODEL MAY BE USED."
+)
 
 
 SYSTEM_PROMPT = """You are the internal PCB layout agent for this repository.
+
+HARD POLICY:
+- You are running under Gemini 3.1 Pro Preview only.
+- Do not assume or reference any other Gemini model variant.
 
 You have exactly 3 tools:
 1) apply_placement_patch
@@ -53,8 +66,10 @@ Rules:
 - Return ONLY one JSON object with this shape:
   {"tool":"<name>","args":{...}}
 - Do not output prose.
+- Be a professional PCB layout designer, not a random mover.
 - Prefer small, targeted moves.
-- After any placement edits, call test_layout.
+- Make ONE placement change at a time (single component per edit).
+- After every placement edit, immediately call test_layout to generate a new snapshot.
 - Call finish_layout only when test_layout reports:
   - overlap_count == 0
   - out_of_bounds_count == 0
@@ -62,6 +77,13 @@ Rules:
   - net_error_count == 0
 - If a tool reports failure, adapt and continue.
 - When finished, call finish_layout with a short summary.
+
+Placement quality objectives:
+- Keep functionally related components close (power block, USB block, IC support parts).
+- Keep connectors and IO-facing parts at logical board edges.
+- Keep decoupling capacitors close to the IC/regulator power pins.
+- Align similar passives for clean routing channels and readability.
+- Avoid placements that are technically valid but physically nonsensical.
 """
 
 
@@ -289,6 +311,11 @@ def _snap(value: float, step: float) -> float:
 
 class LayoutLoop:
     def __init__(self, example: str, model: str, max_iters: int, clearance_mm: float, snap_mm: float):
+        if model != ALLOWED_GEMINI_MODEL:
+            raise RuntimeError(
+                f"{MODEL_POLICY_BANNER} Requested='{model}'. "
+                f"Allowed='{ALLOWED_GEMINI_MODEL}'."
+            )
         self.example = example
         self.model = model
         self.max_iters = max_iters
@@ -312,6 +339,7 @@ class LayoutLoop:
         self.finished = False
         self.finish_summary = ""
         self.history: list[dict[str, Any]] = []
+        self._must_test_after_edit = False
 
         keys = _load_gemini_keys()
         self.client = GeminiClient(model=model, keys=keys)
@@ -361,6 +389,14 @@ class LayoutLoop:
         edits = args.get("edits", [])
         if not isinstance(edits, list):
             return {"ok": False, "error": "edits must be a list"}
+        if not edits:
+            return {"ok": False, "error": "edits is empty"}
+
+        # Enforce incremental loop behavior: one placement change per iteration.
+        multi_edit_truncated = False
+        if len(edits) > 1:
+            edits = edits[:1]
+            multi_edit_truncated = True
 
         applied = []
         rejected = []
@@ -410,13 +446,15 @@ class LayoutLoop:
             applied.append({"ref": ref, "x": x, "y": y, "rotation": rot})
 
         self._write_json("placement.json", self.placement)
+        self._must_test_after_edit = len(applied) > 0
         return {
             "ok": True,
             "applied_count": len(applied),
             "rejected_count": len(rejected),
+            "multi_edit_truncated": multi_edit_truncated,
             "applied": applied[:40],
             "rejected": rejected[:40],
-            "next_best_tool_hint": "Call test_layout next.",
+            "next_best_tool_hint": "MUST call test_layout next to capture a fresh snapshot.",
         }
 
     def _render_snapshot(self, pcb_path: Path, output_png: Path) -> dict[str, Any]:
@@ -437,11 +475,13 @@ class LayoutLoop:
                 "stdout_tail": (proc.stdout or "")[-400:],
                 "stderr_tail": (proc.stderr or "")[-400:],
                 "snapshot_path": str(output_png.relative_to(ROOT)) if ok else None,
+                "snapshot_abs_path": str(output_png.resolve()) if ok else None,
             }
         except Exception as e:
-            return {"ok": False, "error": str(e), "snapshot_path": None}
+            return {"ok": False, "error": str(e), "snapshot_path": None, "snapshot_abs_path": None}
 
     def tool_test_layout(self, args: dict[str, Any]) -> dict[str, Any]:
+        self._must_test_after_edit = False
         net_errors, net_warnings = _validate_nets(self.circuit)
 
         boxes: dict[str, tuple[float, float, float, float]] = {}
@@ -596,6 +636,13 @@ class LayoutLoop:
                     "Iterate placement -> snapshot -> check until layout is ready. "
                     "Then call finish_layout."
                 ),
+                "placement_quality_requirements": [
+                    "Professional and sensible placement, not arbitrary valid coordinates.",
+                    "Keep related functional blocks compact.",
+                    "Preserve clear routing corridors.",
+                    "Use one placement edit at a time.",
+                    "After each edit, run test_layout for a fresh snapshot.",
+                ],
             },
             "tool_contract": {
                 "tools": [
@@ -611,7 +658,8 @@ class LayoutLoop:
                                     "dx": "optional",
                                     "dy": "optional",
                                 }
-                            ]
+                            ],
+                            "policy": "Use exactly one edit item per call.",
                         },
                     },
                     {
@@ -634,6 +682,8 @@ class LayoutLoop:
         return json.dumps(payload, indent=2, sort_keys=True)
 
     def _run_tool(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+        if self._must_test_after_edit and tool_name != "test_layout":
+            return self.tool_test_layout({"reason": "forced-test-after-placement-edit"})
         if tool_name == "apply_placement_patch":
             return self.tool_apply_placement_patch(args)
         if tool_name == "test_layout":
@@ -690,7 +740,11 @@ class LayoutLoop:
             "finish_summary": self.finish_summary,
             "iterations_used": len(self.history) - 1,
             "max_iterations": self.max_iters,
+            "model_policy": MODEL_POLICY_BANNER,
+            "model_used": self.model,
             "run_dir": str(self.run_dir.relative_to(ROOT)),
+            "run_dir_abs": str(self.run_dir.resolve()),
+            "png_abs_paths": sorted(str(p.resolve()) for p in (self.run_dir / "artifacts").glob("*.png")),
             "last_report": self.last_report,
             "next_command": f"./abd forward --example {self.example}",
         }
@@ -699,9 +753,18 @@ class LayoutLoop:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Experimental Gemini internal layout loop")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Experimental Gemini internal layout loop. "
+            "HARD-LOCKED to gemini-3.1-pro-preview only."
+        )
+    )
     parser.add_argument("--example", default="led", help="Board example name (default: led)")
-    parser.add_argument("--model", default="gemini-2.5-pro", help="Gemini model name")
+    parser.add_argument(
+        "--model",
+        default=ALLOWED_GEMINI_MODEL,
+        help=f"Gemini model name (HARD-LOCKED to {ALLOWED_GEMINI_MODEL})",
+    )
     parser.add_argument("--max-iters", type=int, default=8, help="Maximum model iterations")
     parser.add_argument("--clearance-mm", type=float, default=0.2, help="Overlap clearance")
     parser.add_argument("--snap-mm", type=float, default=DEFAULT_SNAP_MM, help="Placement snap grid")
